@@ -3,7 +3,7 @@
   xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <Name>Denon AVR</Name>
   <Identification>
-    <FriendlyName>Denon:\[AVR:.*</FriendlyName>
+    <FriendlyName>^Denon..?(?:AVR|DRA)-.*$</FriendlyName>
     <Manufacturer>Denon</Manufacturer>
     <Headers />
   </Identification>
