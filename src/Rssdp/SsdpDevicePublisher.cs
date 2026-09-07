@@ -357,7 +357,7 @@ namespace Rssdp.Infrastructure
 
                         if (!_sendOnlyMatchedHost || root.Address.Equals(receivedOnlocalIPAddress))
                         {
-                            SendDeviceSearchResponses(device, remoteEndPoint, receivedOnlocalIPAddress, cancellationToken);
+                            SendDeviceSearchResponses(device, searchTarget, remoteEndPoint, receivedOnlocalIPAddress, cancellationToken);
                         }
                     }
                 }
@@ -371,10 +371,25 @@ namespace Rssdp.Infrastructure
 
         private void SendDeviceSearchResponses(
             SsdpDevice device,
+            string searchTarget,
             IPEndPoint endPoint,
             IPAddress receivedOnlocalIPAddress,
             CancellationToken cancellationToken)
         {
+            // UDA 1.0 section 1.3.3: the ST of a search response is the search target that matched,
+            // so a search for one target is answered exactly once. Answering with every target the
+            // device has instead makes control points that check the ST discard the responses.
+            if (!string.Equals(SsdpConstants.SsdpDiscoverAllSTHeader, searchTarget, StringComparison.OrdinalIgnoreCase))
+            {
+                // A search by UUID identifies the device itself, and carries no target after the USN
+                var usn = searchTarget.StartsWith("uuid:", StringComparison.OrdinalIgnoreCase)
+                    ? device.Udn
+                    : GetUsn(device.Udn, searchTarget);
+
+                SendSearchResponse(searchTarget, device, usn, endPoint, receivedOnlocalIPAddress, cancellationToken);
+                return;
+            }
+
             bool isRootDevice = (device as SsdpRootDevice) is not null;
             if (isRootDevice)
             {
