@@ -365,6 +365,8 @@ public class ControlHandler : BaseControlHandler
                 var childAncestorIds = new Guid?[childrenResult.Items.Count];
                 var childCounts = GetChildCounts(childrenResult.Items, item, sortCriteria, childAncestorIds);
 
+                _didlBuilder.PreloadPeople([.. childrenResult.Items.Select(i => i.Item)]);
+
                 for (var index = 0; index < childrenResult.Items.Count; index++)
                 {
                     var i = childrenResult.Items[index];
@@ -461,6 +463,9 @@ public class ControlHandler : BaseControlHandler
             var item = serverItem.Item;
 
             childrenResult = GetSearchResultWithParts(item, _user, searchCriteria, sortCriteria, start, requestedCount, nameStartsWith);
+
+            _didlBuilder.PreloadPeople([.. childrenResult.Items.Select(i => i.Item)]);
+
             foreach (var i in childrenResult.Items)
             {
                 var childItem = i.Item;

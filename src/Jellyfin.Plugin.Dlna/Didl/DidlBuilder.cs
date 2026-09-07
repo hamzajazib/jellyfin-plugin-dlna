@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -47,6 +48,12 @@ public class DidlBuilder
     private const string NsUpnp = "urn:schemas-upnp-org:metadata-1-0/upnp/";
     private const string NsDlna = "urn:schemas-dlna-org:metadata-1-0/";
 
+    /// <summary>
+    /// Seeing some LG models locking up on content with large lists of people. The actual issue
+    /// might just be due to processing more metadata than they can handle.
+    /// </summary>
+    private const int MaxPeoplePerItem = 6;
+
     private readonly DlnaDeviceProfile _profile;
     private readonly IImageProcessor _imageProcessor;
     private readonly string _serverAddress;
@@ -58,6 +65,8 @@ public class DidlBuilder
     private readonly ILogger _logger;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly ILibraryManager _libraryManager;
+
+    private IReadOnlyDictionary<Guid, IReadOnlyList<PersonInfo>>? _preloadedPeople;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DidlBuilder"/> class.
@@ -1003,6 +1012,31 @@ public class DidlBuilder
         writer.WriteFullEndElement();
     }
 
+    /// <summary>
+    /// Fetches the people of a whole listing up front, so that writing it does not query them one
+    /// item at a time.
+    /// </summary>
+    /// <param name="items">The items about to be written.</param>
+    /// <remarks>
+    /// The batch orders each item's people by their list order, where the query per item also broke
+    /// ties on the person type and name. List order is a distinct sequence per item in practice, so
+    /// which people a listing names does not change.
+    /// </remarks>
+    public void PreloadPeople(IReadOnlyList<BaseItem> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+
+        var ids = items
+            .Where(i => i.SupportsPeople)
+            .Select(i => i.Id)
+            .Distinct()
+            .ToArray();
+
+        _preloadedPeople = ids.Length == 0
+            ? new Dictionary<Guid, IReadOnlyList<PersonInfo>>()
+            : _libraryManager.GetPeopleByItems(ids);
+    }
+
     private void AddPeople(BaseItem item, XmlWriter writer)
     {
         if (!item.SupportsPeople)
@@ -1019,17 +1053,19 @@ public class DidlBuilder
             PersonKind.Creator
         };
 
-        // Seeing some LG models locking up due content with large lists of people
-        // The actual issue might just be due to processing a more metadata than it can handle
-        var people = _libraryManager.GetPeople(
-            new InternalPeopleQuery
-            {
-                ItemId = item.Id,
-                Limit = 6,
-                EnableTotalRecordCount = false
-            });
+        // A listing preloads the people of every item it is about to write. An item written on its
+        // own, such as the metadata of one object, still asks for its own.
+        var people = _preloadedPeople is null
+            ? _libraryManager.GetPeople(
+                new InternalPeopleQuery
+                {
+                    ItemId = item.Id,
+                    Limit = MaxPeoplePerItem,
+                    EnableTotalRecordCount = false
+                })
+            : _preloadedPeople.GetValueOrDefault(item.Id) ?? [];
 
-        foreach (var actor in people)
+        foreach (var actor in people.Take(MaxPeoplePerItem))
         {
             var type = types.FirstOrDefault(i => i == actor.Type || string.Equals(actor.Role, i.ToString(), StringComparison.OrdinalIgnoreCase));
             if (type == PersonKind.Unknown)
