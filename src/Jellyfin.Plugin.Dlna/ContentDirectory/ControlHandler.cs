@@ -229,9 +229,9 @@ public class ControlHandler : BaseControlHandler
     /// <param name="xmlWriter">The <see cref="XmlWriter"/>.</param>
     private static void HandleGetSortCapabilities(XmlWriter xmlWriter)
     {
-        xmlWriter.WriteElementString(
-            "SortCaps",
-            "res@duration,res@size,res@bitrate,dc:date,dc:title,dc:size,upnp:album,upnp:artist,upnp:albumArtist,upnp:episodeNumber,upnp:genre,upnp:originalTrackNumber,upnp:rating");
+        // Only what SortCriteria can actually order by, so a client is never handed a listing in a
+        // different order than the one it asked for
+        xmlWriter.WriteElementString("SortCaps", SortCriteria.GetSortCapabilities());
     }
 
     /// <summary>
@@ -1499,6 +1499,14 @@ public class ControlHandler : BaseControlHandler
     /// <param name="isPreSorted">True if pre-sorted.</param>
     private static (ItemSortBy SortName, SortOrder SortOrder)[] GetOrderBy(SortCriteria sort, bool isPreSorted)
     {
+        // An explicit request wins over the natural order of a pre-sorted folder: a control point
+        // that asked for its tracks by album and track number pages them expecting that order, and
+        // groups what it gets, so handing back a different order breaks the listing it builds.
+        if (sort.Fields.Count > 0)
+        {
+            return [.. sort.Fields];
+        }
+
         return isPreSorted ? Array.Empty<(ItemSortBy, SortOrder)>() : [(ItemSortBy.SortName, sort.SortOrder)];
     }
 
