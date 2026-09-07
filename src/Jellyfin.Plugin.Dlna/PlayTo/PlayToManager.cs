@@ -285,7 +285,9 @@ public sealed class PlayToManager : IDisposable
             var profile = _dlnaManager.GetProfile(device.Properties.ToDeviceIdentification()) ??
                           _dlnaManager.GetDefaultProfile();
 
-            _sessionManager.ReportCapabilities(sessionInfo.Id, new ClientCapabilities
+            // No session is controlling this one: the server reports the capabilities it read off the
+            // renderer itself, and an empty controlling session skips the can-control assertion.
+            _sessionManager.ReportCapabilities(null, sessionInfo.Id, new ClientCapabilities
             {
                 PlayableMediaTypes = profile.FetchSupportedMediaTypes(),
 

@@ -716,7 +716,7 @@ public class ControlHandler : BaseControlHandler
 
         if (folderIds.Count > 0)
         {
-            var folderCounts = _libraryManager.GetChildCountBatch(folderIds, _user?.Id);
+            var folderCounts = _libraryManager.GetChildCountBatch(folderIds, _user);
             for (var i = 0; i < folderIds.Count; i++)
             {
                 counts[folderIndexes[i]] = folderCounts.GetValueOrDefault(folderIds[i]);
