@@ -57,20 +57,6 @@ public static class MediaReceiverRegistrarXmlBuilder
 
             new()
             {
-                Name = "A_ARG_TYPE_RegistrationRespMsg",
-                DataType = "bin.base64",
-                SendsEvents = false
-            },
-
-            new()
-            {
-                Name = "A_ARG_TYPE_RegistrationReqMsg",
-                DataType = "bin.base64",
-                SendsEvents = false
-            },
-
-            new()
-            {
                 Name = "ValidationRevokedUpdateID",
                 DataType = "ui4",
                 SendsEvents = true
