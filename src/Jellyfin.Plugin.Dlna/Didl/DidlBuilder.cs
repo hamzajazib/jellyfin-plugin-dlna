@@ -249,13 +249,17 @@ public class DidlBuilder
         {
             var sources = _mediaSourceManager.GetStaticMediaSources(video, true, _user);
 
+            // DirectStream is served as the source file itself, so a device would be handed a
+            // container its profile rejects while the DIDL advertises the target format. Transcode
+            // instead, the same way PlayTo does.
             streamInfo = new StreamBuilder(_mediaEncoder, _logger).GetOptimalVideoStream(new MediaOptions
             {
                 ItemId = video.Id,
                 MediaSources = sources.ToArray(),
                 Profile = _profile,
                 DeviceId = deviceId,
-                MaxBitrate = _profile.MaxStreamingBitrate
+                MaxBitrate = _profile.MaxStreamingBitrate,
+                EnableDirectStream = false
             }) ?? throw new InvalidOperationException("No optimal video stream found");
         }
 
@@ -605,7 +609,8 @@ public class DidlBuilder
                 ItemId = audio.Id,
                 MediaSources = sources.ToArray(),
                 Profile = _profile,
-                DeviceId = deviceId
+                DeviceId = deviceId,
+                EnableDirectStream = false
             }) ?? throw new InvalidOperationException("No optimal audio stream found");
         }
 
