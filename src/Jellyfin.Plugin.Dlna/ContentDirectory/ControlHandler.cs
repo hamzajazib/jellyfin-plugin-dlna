@@ -912,7 +912,21 @@ public class ControlHandler : BaseControlHandler
     /// <param name="nameStartsWith">The letter the results have to start with, if any.</param>
     /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
     private QueryResult<ServerItem> GetSearchResultWithParts(BaseItem item, User? user, SearchCriteria search, SortCriteria sort, int? startIndex, int? limit, string? nameStartsWith = null)
-        => ApplyPaging(ExpandStackedVideos(ToResult(null, GetChildrenSorted(item, user, search, sort, null, null, nameStartsWith)).Items, user), startIndex, limit);
+    {
+        // A search spans a whole library, so the page has to come out of the query: reading every
+        // match to hand back one page of it costs the same whether the client wants 20 rows or all
+        // of them. The parts of a multi-part video are expanded within the page that carries the
+        // video, and the page is trimmed again afterwards so that a client never gets back more
+        // rows than it asked for.
+        var result = GetChildrenSorted(item, user, search, sort, startIndex, limit, nameStartsWith);
+
+        var expanded = ExpandStackedVideos(ToResult(startIndex, result).Items, user);
+
+        return new QueryResult<ServerItem>(
+            startIndex,
+            result.TotalRecordCount,
+            limit.HasValue && expanded.Length > limit.Value ? expanded[..limit.Value] : expanded);
+    }
 
     /// <summary>
     /// Replaces every stacked (multi-part) video in a listing by one item per part, so that the
