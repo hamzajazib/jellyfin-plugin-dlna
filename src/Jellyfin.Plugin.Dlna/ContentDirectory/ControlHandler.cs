@@ -1692,7 +1692,18 @@ public class ControlHandler : BaseControlHandler
             id = id[(paramsIndex + ParamsSrch.Length)..];
 
             var parts = id.Split(';');
-            id = parts[23];
+
+            // Anything else carrying the marker is not the request this handles, and indexing
+            // into it blindly would fault the whole browse
+            const int ItemIdPart = 23;
+            if (parts.Length <= ItemIdPart)
+            {
+                Logger.LogError("Unexpected item Id: {Id}. Returning user root folder.", id);
+
+                return new ServerItem(_libraryManager.GetUserRootFolder(), null);
+            }
+
+            id = parts[ItemIdPart];
         }
 
         var dividerIndex = id.IndexOf('_', StringComparison.Ordinal);
