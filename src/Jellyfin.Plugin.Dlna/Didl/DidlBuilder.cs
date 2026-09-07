@@ -1113,7 +1113,15 @@ public class DidlBuilder
 
         if (item.IndexNumber.HasValue)
         {
-            AddValue(writer, "upnp", "originalTrackNumber", item.IndexNumber.Value.ToString(CultureInfo.InvariantCulture), NsUpnp);
+            // Every disc of a multi disc album numbers its tracks from one, so the disc has to be
+            // folded in or an album comes out with several tracks claiming the same number, which
+            // a control point cannot order. Offsetting by the disc is the convention for that, and
+            // it is applied from the second disc on so a plain album keeps its plain numbering.
+            var trackNumber = item.ParentIndexNumber > 1
+                ? (item.ParentIndexNumber.Value * 100) + item.IndexNumber.Value
+                : item.IndexNumber.Value;
+
+            AddValue(writer, "upnp", "originalTrackNumber", trackNumber.ToString(CultureInfo.InvariantCulture), NsUpnp);
 
             if (item is Episode)
             {
