@@ -49,6 +49,17 @@ public class ControlHandler : BaseControlHandler
     /// </summary>
     private const int MaxCountConcurrency = 4;
 
+    /// <summary>
+    /// The item kinds counted for a container that aggregates content by name. These have to match
+    /// what GetUserItems lists for the container.
+    /// </summary>
+    private static readonly Dictionary<BaseItemKind, BaseItemKind[]> NameItemRelatedKinds = new()
+    {
+        [BaseItemKind.MusicGenre] = [BaseItemKind.MusicAlbum],
+        [BaseItemKind.MusicArtist] = [BaseItemKind.MusicAlbum],
+        [BaseItemKind.Genre] = [BaseItemKind.Movie, BaseItemKind.Series]
+    };
+
     private readonly ILibraryManager _libraryManager;
     private readonly IUserDataManager _userDataManager;
     private readonly User? _user;
@@ -690,6 +701,9 @@ public class ControlHandler : BaseControlHandler
         List<Guid> folderIds = [];
         List<int> folderIndexes = [];
 
+        // Genres and artists aggregate content by name and are batched per kind the same way
+        Dictionary<BaseItemKind, (List<Guid> Ids, List<int> Indexes)> nameItems = [];
+
         // Stub containers cannot be batched into one query, so they are counted side by side
         List<(int Index, ServerItem Child, Guid? AncestorId)> stubs = [];
 
@@ -711,10 +725,17 @@ public class ControlHandler : BaseControlHandler
                 continue;
             }
 
-            var itemByNameCount = GetItemByNameChildCount(child.Item);
-            if (itemByNameCount.HasValue)
+            var nameItemKind = GetNameItemKind(child.Item);
+            if (nameItemKind is not null)
             {
-                counts[index] = itemByNameCount.Value;
+                if (!nameItems.TryGetValue(nameItemKind.Value, out var bucket))
+                {
+                    bucket = ([], []);
+                    nameItems[nameItemKind.Value] = bucket;
+                }
+
+                bucket.Ids.Add(child.Item.Id);
+                bucket.Indexes.Add(index);
             }
             else if (ListsOwnChildren(child))
             {
@@ -760,6 +781,25 @@ public class ControlHandler : BaseControlHandler
                 });
         }
 
+        foreach (var (kind, bucket) in nameItems)
+        {
+            var relatedKinds = NameItemRelatedKinds[kind];
+            var nameItemCounts = _libraryManager.GetItemCountsForNameItems(kind, bucket.Ids, relatedKinds, _user);
+
+            for (var i = 0; i < bucket.Ids.Count; i++)
+            {
+                var itemCounts = nameItemCounts.GetValueOrDefault(bucket.Ids[i]);
+                if (itemCounts is null)
+                {
+                    continue;
+                }
+
+                counts[bucket.Indexes[i]] = kind == BaseItemKind.Genre
+                    ? itemCounts.MovieCount + itemCounts.SeriesCount
+                    : itemCounts.AlbumCount;
+            }
+        }
+
         return counts;
     }
 
@@ -782,32 +822,18 @@ public class ControlHandler : BaseControlHandler
             or StubType.Latest;
 
     /// <summary>
-    /// Gets the child count of a "by name" container using an optimized count query, instead of
-    /// listing every item below it.
+    /// Gets the kind a container aggregating content by name is counted as.
     /// </summary>
     /// <param name="item">The <see cref="BaseItem"/>.</param>
-    /// <returns>The child count, or <c>null</c> if the item is not a "by name" container.</returns>
-    private int? GetItemByNameChildCount(BaseItem item)
-    {
-        // The counted kinds have to match what GetUserItems lists for the container
-        switch (item)
+    /// <returns>The <see cref="BaseItemKind"/>, or <c>null</c> if the item is not one.</returns>
+    private static BaseItemKind? GetNameItemKind(BaseItem item)
+        => item switch
         {
-            case MusicGenre:
-                return _libraryManager
-                    .GetItemCountsForNameItem(BaseItemKind.MusicGenre, item.Id, [BaseItemKind.MusicAlbum], _user)
-                    .AlbumCount;
-            case MusicArtist:
-                return _libraryManager
-                    .GetItemCountsForNameItem(BaseItemKind.MusicArtist, item.Id, [BaseItemKind.MusicAlbum], _user)
-                    .AlbumCount;
-            case Genre:
-                var counts = _libraryManager
-                    .GetItemCountsForNameItem(BaseItemKind.Genre, item.Id, [BaseItemKind.Movie, BaseItemKind.Series], _user);
-                return counts.MovieCount + counts.SeriesCount;
-            default:
-                return null;
-        }
-    }
+            MusicGenre => BaseItemKind.MusicGenre,
+            MusicArtist => BaseItemKind.MusicArtist,
+            Genre => BaseItemKind.Genre,
+            _ => null
+        };
 
     /// <summary>
     /// Returns the User items meeting the criteria, with every stacked (multi-part) video replaced
