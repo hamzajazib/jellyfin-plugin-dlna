@@ -848,7 +848,56 @@ public class ControlHandler : BaseControlHandler
     /// <param name="ancestorId">The library to scope the listing to, if any.</param>
     /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
     private QueryResult<ServerItem> GetUserItemsWithParts(BaseItem item, StubType? stubType, User? user, SortCriteria sort, int? startIndex, int? limit, Guid? ancestorId = null)
-        => ApplyPaging(ExpandStackedVideos(GetUserItems(item, stubType, user, sort, null, null, ancestorId).Items, user), startIndex, limit);
+    {
+        // A listing that is assembled rather than queried has to be read whole and paged here.
+        if (IsAssembledListing(item, stubType))
+        {
+            return ApplyPaging(ExpandStackedVideos(GetUserItems(item, stubType, user, sort, null, null, ancestorId).Items, user), startIndex, limit);
+        }
+
+        // Everything else is a query that can return the page on its own, where reading every row
+        // of a library to hand back one page of it costs the same whether a client asked for
+        // twenty rows or for all of them. The parts of a multi-part video are expanded inside the
+        // page that carries the video, and the page is trimmed again so that a client never gets
+        // back more rows than it asked for.
+        var result = GetUserItems(item, stubType, user, sort, startIndex, limit, ancestorId);
+
+        var expanded = ExpandStackedVideos(result.Items, user);
+
+        return new QueryResult<ServerItem>(
+            startIndex,
+            result.TotalRecordCount,
+            limit.HasValue && expanded.Length > limit.Value ? expanded[..limit.Value] : expanded);
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether a listing is assembled in memory rather than taken from a
+    /// query, so that it has to be read whole before a page of it can be handed back.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/> being listed.</param>
+    /// <param name="stubType">The <see cref="StubType"/>, if any.</param>
+    /// <returns><c>true</c> if the listing is assembled.</returns>
+    /// <remarks>
+    /// This mirrors the dispatching in GetUserItems. The root and a library browsed as its menu of
+    /// stubs are fixed arrays, and Latest, Continue Watching and Next Up cap or renumber theirs.
+    /// All of them are small, so reading them whole costs little.
+    /// </remarks>
+    private static bool IsAssembledListing(BaseItem item, StubType? stubType)
+    {
+        if (item is UserRootFolder
+            || stubType is StubType.Latest or StubType.ContinueWatching or StubType.NextUp)
+        {
+            return true;
+        }
+
+        // A library with no stub type of its own is listed as its menu. The folders and live tv
+        // views are not, they list their content straight from a query.
+        return stubType is null
+            && item is IHasCollectionType
+            {
+                CollectionType: CollectionType.music or CollectionType.movies or CollectionType.tvshows
+            };
+    }
 
     /// <summary>
     /// Returns the search results meeting the criteria, with every stacked (multi-part) video
