@@ -97,6 +97,27 @@ public class DlnaManager : IDlnaManager
         _logger.LogInformation("Using system profile directory {0}", SystemProfilesPath);
         list.AddRange(GetProfiles(SystemProfilesPath, DeviceProfileType.System)
             .OrderBy(i => i.Name));
+
+        WarnAboutUnusableProfiles();
+    }
+
+    /// <summary>
+    /// Logs the profiles that GetProfile can never return, so that a profile which is loaded but
+    /// never applied does not look like a profile that was not picked up at all.
+    /// </summary>
+    private void WarnAboutUnusableProfiles()
+    {
+        foreach (var profile in GetProfiles())
+        {
+            // The default profile is the fallback rather than a candidate, so it identifies nothing
+            // on purpose. Every other profile is matched on its identification alone.
+            if (profile.Identification is null && !string.Equals(profile.Name, "Generic Device", StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Profile {Name} declares no Identification and can never be matched to a device",
+                    profile.Name);
+            }
+        }
     }
 
     /// <summary>
