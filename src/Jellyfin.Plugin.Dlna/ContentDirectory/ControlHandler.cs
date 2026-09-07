@@ -527,6 +527,7 @@ public class ControlHandler : BaseControlHandler
         var folder = (Folder)item;
 
         MediaType[] mediaTypes = [];
+        BaseItemKind[] itemTypes = [];
         bool? isFolder = null;
 
         switch (search.SearchType)
@@ -543,8 +544,15 @@ public class ControlHandler : BaseControlHandler
                 mediaTypes = [MediaType.Photo];
                 isFolder = false;
                 break;
+
+            // Naming the kind, where matching every folder would answer a search for playlists
+            // with every season, album and collection in the library as well
             case SearchType.Playlist:
+                itemTypes = [BaseItemKind.Playlist];
+                isFolder = true;
+                break;
             case SearchType.MusicAlbum:
+                itemTypes = [BaseItemKind.MusicAlbum];
                 isFolder = true;
                 break;
         }
@@ -560,6 +568,7 @@ public class ControlHandler : BaseControlHandler
             ExcludeItemTypes = [BaseItemKind.Book],
             IsFolder = isFolder,
             MediaTypes = mediaTypes,
+            IncludeItemTypes = itemTypes,
             NameContains = search.NameContains,
             NameStartsWith = nameStartsWith,
             SearchTerm = search.SearchTerm,
