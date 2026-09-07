@@ -275,11 +275,17 @@ public static class ContentFeatureBuilder
             }
             else if (isDirectStream)
             {
-                // orgOp should be added all the time once the time based seek is resolved for transcoded streams
                 contentFeatureList.Add("DLNA.ORG_PN=" + orgPn + orgOp + orgCi + dlnaflags);
             }
             else
             {
+                // A transcode is deliberately advertised without any operation, which reads as
+                // "cannot seek". It does answer TimeSeekRange.dlna.org, and says so in the
+                // contentFeatures header of its own response, so DLNA.ORG_OP=10 would be true.
+                // Windows Media Player then seeks by byte range anyway, and a byte range on a
+                // transcode is answered 200 with Accept-Ranges: none and the stream restarted
+                // from the beginning, which leaves the player waiting for data that never comes.
+                // Turning this back on needs a per profile switch for who is told it can seek.
                 contentFeatureList.Add("DLNA.ORG_PN=" + orgPn + orgCi + dlnaflags);
             }
         }

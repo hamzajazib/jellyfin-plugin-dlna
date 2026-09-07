@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using Jellyfin.Extensions;
 using Jellyfin.Extensions.Json;
 using Jellyfin.Plugin.Dlna.Model;
@@ -96,6 +97,27 @@ public class DlnaManager : IDlnaManager
         _logger.LogInformation("Using system profile directory {0}", SystemProfilesPath);
         list.AddRange(GetProfiles(SystemProfilesPath, DeviceProfileType.System)
             .OrderBy(i => i.Name));
+
+        WarnAboutUnusableProfiles();
+    }
+
+    /// <summary>
+    /// Logs the profiles that GetProfile can never return, so that a profile which is loaded but
+    /// never applied does not look like a profile that was not picked up at all.
+    /// </summary>
+    private void WarnAboutUnusableProfiles()
+    {
+        foreach (var profile in GetProfiles())
+        {
+            // The default profile is the fallback rather than a candidate, so it identifies nothing
+            // on purpose. Every other profile is matched on its identification alone.
+            if (profile.Identification is null && !string.Equals(profile.Name, "Generic Device", StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Profile {Name} declares no Identification and can never be matched to a device",
+                    profile.Name);
+            }
+        }
     }
 
     /// <summary>
@@ -281,7 +303,7 @@ public class DlnaManager : IDlnaManager
 
             try
             {
-                var tempProfile = (DlnaDeviceProfile)_xmlSerializer.DeserializeFromFile(typeof(DlnaDeviceProfile), path);
+                var tempProfile = DeserializeProfile(path);
                 var profile = ReserializeProfile(tempProfile);
 
                 profile.Id = path.ToLowerInvariant().GetMD5();
@@ -296,6 +318,56 @@ public class DlnaManager : IDlnaManager
 
                 return null;
             }
+        }
+    }
+
+    /// <summary>
+    /// Deserializes a profile file, retrying without the attributes that carry no value.
+    /// </summary>
+    /// <param name="path">The path of the profile file.</param>
+    /// <returns>The <see cref="DlnaDeviceProfile"/>.</returns>
+    /// <remarks>
+    /// Profiles written by the device profile editor of Jellyfin 10.8 spell an unset attribute out
+    /// as an empty one. Most of them are typed as an enum, a bool or an int, none of which accept
+    /// an empty value, so the whole profile would be dropped over an attribute that was never set.
+    /// </remarks>
+    private DlnaDeviceProfile DeserializeProfile(string path)
+    {
+        try
+        {
+            return (DlnaDeviceProfile)_xmlSerializer.DeserializeFromFile(typeof(DlnaDeviceProfile), path);
+        }
+        catch (Exception ex)
+        {
+            var document = XDocument.Load(path);
+
+            var empty = document.Descendants()
+                .SelectMany(element => element.Attributes())
+                .Where(attribute => !attribute.IsNamespaceDeclaration && attribute.Value.Length == 0)
+                .ToList();
+
+            if (empty.Count == 0)
+            {
+                throw;
+            }
+
+            _logger.LogWarning(
+                ex,
+                "Profile file {Path} could not be read, retrying without its {Count} empty attributes: {Attributes}",
+                path,
+                empty.Count,
+                string.Join(", ", empty.Select(attribute => attribute.Name.LocalName).Distinct()));
+
+            foreach (var attribute in empty)
+            {
+                attribute.Remove();
+            }
+
+            using var stream = new MemoryStream();
+            document.Save(stream, SaveOptions.DisableFormatting);
+            stream.Position = 0;
+
+            return (DlnaDeviceProfile)_xmlSerializer.DeserializeFromStream(typeof(DlnaDeviceProfile), stream);
         }
     }
 

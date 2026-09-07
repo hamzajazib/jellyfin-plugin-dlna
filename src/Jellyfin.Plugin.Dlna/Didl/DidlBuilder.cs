@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -47,6 +48,12 @@ public class DidlBuilder
     private const string NsUpnp = "urn:schemas-upnp-org:metadata-1-0/upnp/";
     private const string NsDlna = "urn:schemas-dlna-org:metadata-1-0/";
 
+    /// <summary>
+    /// Seeing some LG models locking up on content with large lists of people. The actual issue
+    /// might just be due to processing more metadata than they can handle.
+    /// </summary>
+    private const int MaxPeoplePerItem = 6;
+
     private readonly DlnaDeviceProfile _profile;
     private readonly IImageProcessor _imageProcessor;
     private readonly string _serverAddress;
@@ -58,6 +65,8 @@ public class DidlBuilder
     private readonly ILogger _logger;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly ILibraryManager _libraryManager;
+
+    private IReadOnlyDictionary<Guid, IReadOnlyList<PersonInfo>>? _preloadedPeople;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DidlBuilder"/> class.
@@ -228,19 +237,76 @@ public class DidlBuilder
 
         if (item is IHasMediaSources)
         {
-            switch (item.MediaType)
+            // Resolved before anything is written, because an item whose media source cannot be
+            // turned into a stream, such as one whose streams were never analysed, would otherwise
+            // fault the whole listing on its way out. It is described without a resource instead.
+            var resource = ResolveStreamInfo(item, deviceId, streamInfo);
+
+            if (resource is not null)
             {
-                case MediaType.Audio:
-                    AddAudioResource(writer, item, deviceId, filter, streamInfo);
-                    break;
-                case MediaType.Video:
-                    AddVideoResource(writer, item, deviceId, filter, streamInfo);
-                    break;
+                switch (item.MediaType)
+                {
+                    case MediaType.Audio:
+                        AddAudioResource(writer, item, deviceId, filter, resource);
+                        break;
+                    case MediaType.Video:
+                        AddVideoResource(writer, item, deviceId, filter, resource);
+                        break;
+                }
             }
         }
 
         AddCover(item, null, writer, false);
         writer.WriteFullEndElement();
+    }
+
+    /// <summary>
+    /// Works out how an item would be streamed to the device, if it can be.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/>.</param>
+    /// <param name="deviceId">The device id.</param>
+    /// <param name="streamInfo">An already resolved <see cref="StreamInfo"/>, if there is one.</param>
+    /// <returns>The <see cref="StreamInfo"/>, or <c>null</c> if the item cannot be streamed.</returns>
+    private StreamInfo? ResolveStreamInfo(BaseItem item, string deviceId, StreamInfo? streamInfo)
+    {
+        if (streamInfo is not null)
+        {
+            return streamInfo;
+        }
+
+        try
+        {
+            var sources = _mediaSourceManager.GetStaticMediaSources(item, true, _user);
+
+            var options = new MediaOptions
+            {
+                ItemId = item.Id,
+                MediaSources = sources.ToArray(),
+                Profile = _profile,
+                DeviceId = deviceId,
+                EnableDirectStream = false
+            };
+
+            var builder = new StreamBuilder(_mediaEncoder, _logger);
+
+            if (item.MediaType == MediaType.Audio)
+            {
+                return builder.GetOptimalAudioStream(options);
+            }
+
+            options.MaxBitrate = _profile.MaxStreamingBitrate;
+
+            return builder.GetOptimalVideoStream(options);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Describing {Name} without a resource, its media source cannot be streamed",
+                item.Name);
+
+            return null;
+        }
     }
 
     private void AddVideoResource(XmlWriter writer, BaseItem video, string deviceId, Filter filter, StreamInfo? streamInfo = null)
@@ -249,13 +315,17 @@ public class DidlBuilder
         {
             var sources = _mediaSourceManager.GetStaticMediaSources(video, true, _user);
 
+            // DirectStream is served as the source file itself, so a device would be handed a
+            // container its profile rejects while the DIDL advertises the target format. Transcode
+            // instead, the same way PlayTo does.
             streamInfo = new StreamBuilder(_mediaEncoder, _logger).GetOptimalVideoStream(new MediaOptions
             {
                 ItemId = video.Id,
                 MediaSources = sources.ToArray(),
                 Profile = _profile,
                 DeviceId = deviceId,
-                MaxBitrate = _profile.MaxStreamingBitrate
+                MaxBitrate = _profile.MaxStreamingBitrate,
+                EnableDirectStream = false
             }) ?? throw new InvalidOperationException("No optimal video stream found");
         }
 
@@ -605,7 +675,8 @@ public class DidlBuilder
                 ItemId = audio.Id,
                 MediaSources = sources.ToArray(),
                 Profile = _profile,
-                DeviceId = deviceId
+                DeviceId = deviceId,
+                EnableDirectStream = false
             }) ?? throw new InvalidOperationException("No optimal audio stream found");
         }
 
@@ -941,6 +1012,31 @@ public class DidlBuilder
         writer.WriteFullEndElement();
     }
 
+    /// <summary>
+    /// Fetches the people of a whole listing up front, so that writing it does not query them one
+    /// item at a time.
+    /// </summary>
+    /// <param name="items">The items about to be written.</param>
+    /// <remarks>
+    /// The batch orders each item's people by their list order, where the query per item also broke
+    /// ties on the person type and name. List order is a distinct sequence per item in practice, so
+    /// which people a listing names does not change.
+    /// </remarks>
+    public void PreloadPeople(IReadOnlyList<BaseItem> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+
+        var ids = items
+            .Where(i => i.SupportsPeople)
+            .Select(i => i.Id)
+            .Distinct()
+            .ToArray();
+
+        _preloadedPeople = ids.Length == 0
+            ? new Dictionary<Guid, IReadOnlyList<PersonInfo>>()
+            : _libraryManager.GetPeopleByItems(ids);
+    }
+
     private void AddPeople(BaseItem item, XmlWriter writer)
     {
         if (!item.SupportsPeople)
@@ -957,17 +1053,19 @@ public class DidlBuilder
             PersonKind.Creator
         };
 
-        // Seeing some LG models locking up due content with large lists of people
-        // The actual issue might just be due to processing a more metadata than it can handle
-        var people = _libraryManager.GetPeople(
-            new InternalPeopleQuery
-            {
-                ItemId = item.Id,
-                Limit = 6,
-                EnableTotalRecordCount = false
-            });
+        // A listing preloads the people of every item it is about to write. An item written on its
+        // own, such as the metadata of one object, still asks for its own.
+        var people = _preloadedPeople is null
+            ? _libraryManager.GetPeople(
+                new InternalPeopleQuery
+                {
+                    ItemId = item.Id,
+                    Limit = MaxPeoplePerItem,
+                    EnableTotalRecordCount = false
+                })
+            : _preloadedPeople.GetValueOrDefault(item.Id) ?? [];
 
-        foreach (var actor in people)
+        foreach (var actor in people.Take(MaxPeoplePerItem))
         {
             var type = types.FirstOrDefault(i => i == actor.Type || string.Equals(actor.Role, i.ToString(), StringComparison.OrdinalIgnoreCase));
             if (type == PersonKind.Unknown)
@@ -1015,7 +1113,15 @@ public class DidlBuilder
 
         if (item.IndexNumber.HasValue)
         {
-            AddValue(writer, "upnp", "originalTrackNumber", item.IndexNumber.Value.ToString(CultureInfo.InvariantCulture), NsUpnp);
+            // Every disc of a multi disc album numbers its tracks from one, so the disc has to be
+            // folded in or an album comes out with several tracks claiming the same number, which
+            // a control point cannot order. Offsetting by the disc is the convention for that, and
+            // it is applied from the second disc on so a plain album keeps its plain numbering.
+            var trackNumber = item.ParentIndexNumber > 1
+                ? (item.ParentIndexNumber.Value * 100) + item.IndexNumber.Value
+                : item.IndexNumber.Value;
+
+            AddValue(writer, "upnp", "originalTrackNumber", trackNumber.ToString(CultureInfo.InvariantCulture), NsUpnp);
 
             if (item is Episode)
             {

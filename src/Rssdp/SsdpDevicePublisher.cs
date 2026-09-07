@@ -349,15 +349,25 @@ namespace Rssdp.Infrastructure
 
                 if (devices is not null)
                 {
-                    // WriteTrace(String.Format("Sending {0} search responses", deviceList.Count));
+                    // A multicast search reaches every interface this server listens on, so a host
+                    // with several of them would answer once per interface, each naming its own
+                    // address. A control point that picks the wrong answer is handed a location it
+                    // cannot route to. Answer from the interface the requester shares a subnet with
+                    // when there is one, and fall back to the receiving interface for a requester
+                    // that is routed in from somewhere else.
+                    var onRequesterSubnet = devices
+                        .Where(d => IsOnSameSubnet(d.ToRootDevice(), remoteEndPoint.Address))
+                        .ToArray();
 
-                    foreach (var device in devices)
+                    var answering = onRequesterSubnet.Length > 0 ? onRequesterSubnet : devices;
+
+                    foreach (var device in answering)
                     {
                         var root = device.ToRootDevice();
 
-                        if (!_sendOnlyMatchedHost || root.Address.Equals(receivedOnlocalIPAddress))
+                        if (onRequesterSubnet.Length > 0 || !_sendOnlyMatchedHost || root.Address.Equals(receivedOnlocalIPAddress))
                         {
-                            SendDeviceSearchResponses(device, remoteEndPoint, receivedOnlocalIPAddress, cancellationToken);
+                            SendDeviceSearchResponses(device, searchTarget, remoteEndPoint, receivedOnlocalIPAddress, cancellationToken);
                         }
                     }
                 }
@@ -371,10 +381,25 @@ namespace Rssdp.Infrastructure
 
         private void SendDeviceSearchResponses(
             SsdpDevice device,
+            string searchTarget,
             IPEndPoint endPoint,
             IPAddress receivedOnlocalIPAddress,
             CancellationToken cancellationToken)
         {
+            // UDA 1.0 section 1.3.3: the ST of a search response is the search target that matched,
+            // so a search for one target is answered exactly once. Answering with every target the
+            // device has instead makes control points that check the ST discard the responses.
+            if (!string.Equals(SsdpConstants.SsdpDiscoverAllSTHeader, searchTarget, StringComparison.OrdinalIgnoreCase))
+            {
+                // A search by UUID identifies the device itself, and carries no target after the USN
+                var usn = searchTarget.StartsWith("uuid:", StringComparison.OrdinalIgnoreCase)
+                    ? device.Udn
+                    : GetUsn(device.Udn, searchTarget);
+
+                SendSearchResponse(searchTarget, device, usn, endPoint, receivedOnlocalIPAddress, cancellationToken);
+                return;
+            }
+
             bool isRootDevice = (device as SsdpRootDevice) is not null;
             if (isRootDevice)
             {
@@ -388,6 +413,31 @@ namespace Rssdp.Infrastructure
             SendSearchResponse(device.Udn, device, device.Udn, endPoint, receivedOnlocalIPAddress, cancellationToken);
 
             SendSearchResponse(device.FullDeviceType, device, GetUsn(device.Udn, device.FullDeviceType), endPoint, receivedOnlocalIPAddress, cancellationToken);
+        }
+
+        /// <summary>
+        /// Gets a value indicating whether an address is inside the subnet a root device is published on.
+        /// </summary>
+        /// <param name="rootDevice">The <see cref="SsdpRootDevice"/>.</param>
+        /// <param name="address">The address to test.</param>
+        /// <returns><c>true</c> if the address is on the same subnet.</returns>
+        private static bool IsOnSameSubnet(SsdpRootDevice rootDevice, IPAddress address)
+        {
+            if (rootDevice.PrefixLength == 0
+                || rootDevice.Address.AddressFamily != address.AddressFamily)
+            {
+                return false;
+            }
+
+            try
+            {
+                return new IPNetwork(rootDevice.Address, rootDevice.PrefixLength).Contains(address);
+            }
+            catch (ArgumentException)
+            {
+                // A prefix length that does not fit the address family cannot describe a subnet
+                return false;
+            }
         }
 
         private string GetUsn(string udn, string fullDeviceType)

@@ -34,6 +34,7 @@ namespace Rssdp.Infrastructure
 
         private object _BroadcastListenSocketSynchroniser = new();
         private List<Socket>? _MulticastListenSockets;
+        private List<Socket>? _unicastListenSockets;
 
         private object _SendSocketSynchroniser = new();
         private List<Socket>? _sendSockets;
@@ -123,6 +124,8 @@ namespace Rssdp.Infrastructure
                         _logger.LogError(ex, "Error in BeginListeningForMulticast");
                     }
                 }
+
+                _unicastListenSockets ??= CreateUnicastSocketsAndListen();
             }
         }
 
@@ -143,6 +146,16 @@ namespace Rssdp.Infrastructure
                     }
 
                     _MulticastListenSockets = null;
+                }
+
+                if (_unicastListenSockets is not null)
+                {
+                    foreach (var socket in _unicastListenSockets)
+                    {
+                        socket.Dispose();
+                    }
+
+                    _unicastListenSockets = null;
                 }
             }
         }
@@ -389,6 +402,44 @@ namespace Rssdp.Infrastructure
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to create SSDP UDP multicast socket for {0} on interface {1} (index {2})", intf, intf.Name, intf.Index);
+                }
+            }
+
+            return sockets;
+        }
+
+        /// <summary>
+        /// Creates the sockets that answer a search sent straight to this server rather than to the
+        /// multicast group.
+        /// </summary>
+        /// <remarks>
+        /// UPnP Device Architecture 1.1 section 1.3.3 has a control point address a search to a
+        /// device directly, which reaches port 1900 of that device rather than the multicast group.
+        /// The multicast sockets cannot serve those: on Linux they are bound to the group address,
+        /// so only datagrams addressed to the group arrive on them, and the send sockets sit on an
+        /// arbitrary port. Windows may already hold port 1900 for its own SSDP service, so failing
+        /// to bind is expected there and costs only unicast search support.
+        /// </remarks>
+        /// <returns>The listening sockets.</returns>
+        private List<Socket> CreateUnicastSocketsAndListen()
+        {
+            var sockets = new List<Socket>();
+
+            foreach (var intf in GetBindIPs())
+            {
+                try
+                {
+                    var socket = CreateSsdpUdpSocket(intf, _MulticastTtl, SsdpConstants.MulticastPort);
+                    _ = ListenToSocketInternal(socket, intf);
+                    sockets.Add(socket);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        "Not answering searches sent directly to {Address}: could not bind port {Port} ({Message})",
+                        intf.Address,
+                        SsdpConstants.MulticastPort,
+                        ex.Message);
                 }
             }
 
