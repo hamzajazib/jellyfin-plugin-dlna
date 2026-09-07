@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Xml;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
@@ -41,6 +42,12 @@ public class ControlHandler : BaseControlHandler
     private const string NsDlna = "urn:schemas-dlna-org:metadata-1-0/";
     private const string NsUpnp = "urn:schemas-upnp-org:metadata-1-0/upnp/";
     private const int MaxPageSize = 200;
+
+    /// <summary>
+    /// How many of the counts a listing needs are queried at once. The queries overlap only in
+    /// part, so a wider fan out mostly adds contention for everything else using the library.
+    /// </summary>
+    private const int MaxCountConcurrency = 4;
 
     private readonly ILibraryManager _libraryManager;
     private readonly IUserDataManager _userDataManager;
@@ -683,6 +690,9 @@ public class ControlHandler : BaseControlHandler
         List<Guid> folderIds = [];
         List<int> folderIndexes = [];
 
+        // Stub containers cannot be batched into one query, so they are counted side by side
+        List<(int Index, ServerItem Child, Guid? AncestorId)> stubs = [];
+
         for (var index = 0; index < children.Count; index++)
         {
             var child = children[index];
@@ -713,9 +723,9 @@ public class ControlHandler : BaseControlHandler
             }
             else
             {
-                // A stub container has no children of its own, its content has to be listed
-                counts[index] = GetUserItemsWithParts(child.Item, child.StubType, _user, sort, null, null, ancestorId)
-                    .TotalRecordCount;
+                // A stub container lists the result of a query rather than children of its own, so
+                // it needs a query of its own to be counted. Collected and run together below.
+                stubs.Add((index, child, ancestorId));
             }
         }
 
@@ -728,8 +738,48 @@ public class ControlHandler : BaseControlHandler
             }
         }
 
+        if (stubs.Count > 0)
+        {
+            // The counts of a menu are independent of each other, so running them side by side
+            // makes a menu cost about as much as its slowest entry rather than the sum of them all.
+            // Bounded, so browsing cannot fan a single request out across the whole library at once.
+            Parallel.ForEach(
+                stubs,
+                new ParallelOptions { MaxDegreeOfParallelism = Math.Min(stubs.Count, MaxCountConcurrency) },
+                stub =>
+                {
+                    // A stub that lists its query as it comes reports that query's own total, so
+                    // asking for a single row is enough to learn the count. One that assembles its
+                    // listing has to be listed, because the total of the query behind it counts
+                    // content the listing never shows.
+                    counts[stub.Index] = IsListedInMemory(stub.Child.StubType)
+                        ? GetUserItemsWithParts(stub.Child.Item, stub.Child.StubType, _user, sort, null, null, stub.AncestorId)
+                            .TotalRecordCount
+                        : GetUserItems(stub.Child.Item, stub.Child.StubType, _user, sort, 0, 1, stub.AncestorId)
+                            .TotalRecordCount;
+                });
+        }
+
         return counts;
     }
+
+    /// <summary>
+    /// Gets a value indicating whether the listing of a stub is assembled in memory rather than
+    /// taken from a query as it comes, so that its count is the length of that listing.
+    /// </summary>
+    /// <param name="stubType">The <see cref="StubType"/>, or <c>null</c> for a library listed as
+    /// its menu of stubs.</param>
+    /// <returns><c>true</c> if only listing it reports its count.</returns>
+    /// <remarks>
+    /// These listings cap themselves, so asking their query for a total reports how much content
+    /// exists rather than how much the listing shows, and a client is told a count it can never
+    /// browse to. All of them are small, so listing them to count them is cheap.
+    /// </remarks>
+    private static bool IsListedInMemory(StubType? stubType)
+        => stubType is null
+            or StubType.ContinueWatching
+            or StubType.NextUp
+            or StubType.Latest;
 
     /// <summary>
     /// Gets the child count of a "by name" container using an optimized count query, instead of
