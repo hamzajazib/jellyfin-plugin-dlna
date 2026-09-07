@@ -1013,9 +1013,25 @@ public class Device : IDisposable
         // first try to add a root node with a dlna namespace.
         try
         {
-            return XElement.Parse("<data xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">" + xml + "</data>")
-                .Descendants()
-                .First();
+            var wrapped = XElement.Parse("<data xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">" + xml + "</data>");
+
+            // A body that holds no element at all yields no descendant to return, so take
+            // FirstOrDefault: First would throw past the XmlException handlers of every
+            // remaining attempt and out of this method.
+            var element = wrapped.Descendants().FirstOrDefault();
+            if (element is not null)
+            {
+                return element;
+            }
+
+            // Some devices escape their metadata twice, which leaves the wrapped document holding
+            // the DIDL as text rather than as elements. Unescaping once more turns it back into
+            // markup. The value always shortens on the way, so this cannot recurse indefinitely.
+            var text = wrapped.Value;
+            if (!string.IsNullOrWhiteSpace(text) && text.Length < xml.Length)
+            {
+                return ParseResponse(text);
+            }
         }
         catch (XmlException)
         {
