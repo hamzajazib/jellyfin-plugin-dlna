@@ -228,19 +228,76 @@ public class DidlBuilder
 
         if (item is IHasMediaSources)
         {
-            switch (item.MediaType)
+            // Resolved before anything is written, because an item whose media source cannot be
+            // turned into a stream, such as one whose streams were never analysed, would otherwise
+            // fault the whole listing on its way out. It is described without a resource instead.
+            var resource = ResolveStreamInfo(item, deviceId, streamInfo);
+
+            if (resource is not null)
             {
-                case MediaType.Audio:
-                    AddAudioResource(writer, item, deviceId, filter, streamInfo);
-                    break;
-                case MediaType.Video:
-                    AddVideoResource(writer, item, deviceId, filter, streamInfo);
-                    break;
+                switch (item.MediaType)
+                {
+                    case MediaType.Audio:
+                        AddAudioResource(writer, item, deviceId, filter, resource);
+                        break;
+                    case MediaType.Video:
+                        AddVideoResource(writer, item, deviceId, filter, resource);
+                        break;
+                }
             }
         }
 
         AddCover(item, null, writer, false);
         writer.WriteFullEndElement();
+    }
+
+    /// <summary>
+    /// Works out how an item would be streamed to the device, if it can be.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/>.</param>
+    /// <param name="deviceId">The device id.</param>
+    /// <param name="streamInfo">An already resolved <see cref="StreamInfo"/>, if there is one.</param>
+    /// <returns>The <see cref="StreamInfo"/>, or <c>null</c> if the item cannot be streamed.</returns>
+    private StreamInfo? ResolveStreamInfo(BaseItem item, string deviceId, StreamInfo? streamInfo)
+    {
+        if (streamInfo is not null)
+        {
+            return streamInfo;
+        }
+
+        try
+        {
+            var sources = _mediaSourceManager.GetStaticMediaSources(item, true, _user);
+
+            var options = new MediaOptions
+            {
+                ItemId = item.Id,
+                MediaSources = sources.ToArray(),
+                Profile = _profile,
+                DeviceId = deviceId,
+                EnableDirectStream = false
+            };
+
+            var builder = new StreamBuilder(_mediaEncoder, _logger);
+
+            if (item.MediaType == MediaType.Audio)
+            {
+                return builder.GetOptimalAudioStream(options);
+            }
+
+            options.MaxBitrate = _profile.MaxStreamingBitrate;
+
+            return builder.GetOptimalVideoStream(options);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Describing {Name} without a resource, its media source cannot be streamed",
+                item.Name);
+
+            return null;
+        }
     }
 
     private void AddVideoResource(XmlWriter writer, BaseItem video, string deviceId, Filter filter, StreamInfo? streamInfo = null)
