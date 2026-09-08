@@ -5,11 +5,13 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Xml;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.Dlna.Didl;
+using Jellyfin.Plugin.Dlna.Localization;
 using Jellyfin.Plugin.Dlna.Model;
 using Jellyfin.Plugin.Dlna.Service;
 using MediaBrowser.Common.Extensions;
@@ -22,7 +24,7 @@ using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.TV;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
-using MediaBrowser.Model.Globalization;
+using MediaBrowser.Model.Library;
 using MediaBrowser.Model.Querying;
 using Microsoft.Extensions.Logging;
 using DeviceProfile = MediaBrowser.Model.Dlna.DeviceProfile;
@@ -39,6 +41,24 @@ public class ControlHandler : BaseControlHandler
     private const string NsDidl = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/";
     private const string NsDlna = "urn:schemas-dlna-org:metadata-1-0/";
     private const string NsUpnp = "urn:schemas-upnp-org:metadata-1-0/upnp/";
+    private const int MaxPageSize = 200;
+
+    /// <summary>
+    /// How many of the counts a listing needs are queried at once. The queries overlap only in
+    /// part, so a wider fan out mostly adds contention for everything else using the library.
+    /// </summary>
+    private const int MaxCountConcurrency = 4;
+
+    /// <summary>
+    /// The item kinds counted for a container that aggregates content by name. These have to match
+    /// what GetUserItems lists for the container.
+    /// </summary>
+    private static readonly Dictionary<BaseItemKind, BaseItemKind[]> NameItemRelatedKinds = new()
+    {
+        [BaseItemKind.MusicGenre] = [BaseItemKind.MusicAlbum],
+        [BaseItemKind.MusicArtist] = [BaseItemKind.MusicAlbum],
+        [BaseItemKind.Genre] = [BaseItemKind.Movie, BaseItemKind.Series]
+    };
 
     private readonly ILibraryManager _libraryManager;
     private readonly IUserDataManager _userDataManager;
@@ -64,7 +84,7 @@ public class ControlHandler : BaseControlHandler
     /// <param name="userDataManager">Instance of the <see cref="IUserDataManager"/> interface.</param>
     /// <param name="user">The <see cref="User"/>.</param>
     /// <param name="systemUpdateId">The system id.</param>
-    /// <param name="localization">Instance of the <see cref="ILocalizationManager"/> interface.</param>
+    /// <param name="localization">Instance of the <see cref="DlnaLocalization"/> class.</param>
     /// <param name="mediaSourceManager">Instance of the <see cref="IMediaSourceManager"/> interface.</param>
     /// <param name="userViewManager">Instance of the <see cref="IUserViewManager"/> interface.</param>
     /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
@@ -79,7 +99,7 @@ public class ControlHandler : BaseControlHandler
         IUserDataManager userDataManager,
         User? user,
         int systemUpdateId,
-        ILocalizationManager localization,
+        DlnaLocalization localization,
         IMediaSourceManager mediaSourceManager,
         IUserViewManager userViewManager,
         IMediaEncoder mediaEncoder,
@@ -227,9 +247,9 @@ public class ControlHandler : BaseControlHandler
     /// <param name="xmlWriter">The <see cref="XmlWriter"/>.</param>
     private static void HandleGetSortCapabilities(XmlWriter xmlWriter)
     {
-        xmlWriter.WriteElementString(
-            "SortCaps",
-            "res@duration,res@size,res@bitrate,dc:date,dc:title,dc:size,upnp:album,upnp:artist,upnp:albumArtist,upnp:episodeNumber,upnp:genre,upnp:originalTrackNumber,upnp:rating");
+        // Only what SortCriteria can actually order by, so a client is never handed a listing in a
+        // different order than the one it asked for
+        xmlWriter.WriteElementString("SortCaps", SortCriteria.GetSortCapabilities());
     }
 
     /// <summary>
@@ -299,14 +319,12 @@ public class ControlHandler : BaseControlHandler
 
         var provided = 0;
 
-        // Default to null instead of 0
-        // Upnp inspector sends 0 as requestedCount when it wants everything
-        int? requestedCount = null;
+        int? requestedCount = MaxPageSize;
         int? start = 0;
 
         if (sparams.ContainsKey("RequestedCount") && int.TryParse(sparams["RequestedCount"], out var requestedVal) && requestedVal > 0)
         {
-            requestedCount = requestedVal;
+            requestedCount = Math.Min(requestedVal, MaxPageSize);
         }
 
         if (sparams.ContainsKey("StartingIndex") && int.TryParse(sparams["StartingIndex"], out var startVal) && startVal > 0)
@@ -342,41 +360,44 @@ public class ControlHandler : BaseControlHandler
             {
                 totalCount = 1;
 
-                if (item.IsDisplayedAsFolder || serverItem.StubType.HasValue)
+                if (IsWrittenAsContainer(serverItem))
                 {
-                    var childrenResult = GetUserItems(item, serverItem.StubType, _user, sortCriteria, start, requestedCount);
+                    var childCount = GetChildCounts([serverItem], null, sortCriteria)[0];
 
-                    _didlBuilder.WriteFolderElement(writer, item, serverItem.StubType, null, childrenResult.TotalRecordCount, filter, id);
+                    _didlBuilder.WriteFolderElement(writer, item, serverItem.StubType, null, childCount, filter, id);
                 }
                 else
                 {
-                    _didlBuilder.WriteItemElement(writer, item, _user, null, null, deviceId, filter);
+                    _didlBuilder.WriteItemElement(writer, item, _user, null, null, deviceId, filter, null, GetPartNumber(item));
                 }
 
                 provided++;
             }
             else
             {
-                var childrenResult = GetUserItems(item, serverItem.StubType, _user, sortCriteria, start, requestedCount);
+                var childrenResult = GetUserItemsWithParts(item, serverItem.StubType, _user, sortCriteria, start, requestedCount, serverItem.AncestorId);
                 totalCount = childrenResult.TotalRecordCount;
 
                 provided = childrenResult.Items.Count;
 
-                foreach (var i in childrenResult.Items)
+                var childAncestorIds = new Guid?[childrenResult.Items.Count];
+                var childCounts = GetChildCounts(childrenResult.Items, item, sortCriteria, childAncestorIds);
+
+                _didlBuilder.PreloadPeople([.. childrenResult.Items.Select(i => i.Item)]);
+
+                for (var index = 0; index < childrenResult.Items.Count; index++)
                 {
+                    var i = childrenResult.Items[index];
                     var childItem = i.Item;
                     var displayStubType = i.StubType;
 
-                    if (childItem.IsDisplayedAsFolder || displayStubType.HasValue)
+                    if (IsWrittenAsContainer(i))
                     {
-                        var childCount = GetUserItems(childItem, displayStubType, _user, sortCriteria, null, null)
-                            .TotalRecordCount;
-
-                        _didlBuilder.WriteFolderElement(writer, childItem, displayStubType, item, childCount, filter);
+                        _didlBuilder.WriteFolderElement(writer, childItem, displayStubType, item, childCounts[index], filter, null, childAncestorIds[index]);
                     }
                     else
                     {
-                        _didlBuilder.WriteItemElement(writer, childItem, _user, item, serverItem.StubType, deviceId, filter);
+                        _didlBuilder.WriteItemElement(writer, childItem, _user, item, serverItem.StubType, deviceId, filter, null, i.PartNumber);
                     }
                 }
             }
@@ -399,8 +420,12 @@ public class ControlHandler : BaseControlHandler
     /// <param name="deviceId">The device id.</param>
     private void HandleXBrowseByLetter(XmlWriter xmlWriter, IReadOnlyDictionary<string, string> sparams, string deviceId)
     {
-        // TODO: Implement this method
-        HandleSearch(xmlWriter, sparams, deviceId);
+        // Devices disagree on the name of the argument carrying the letter
+        var letter = sparams.GetValueOrDefault("StartingLetter")
+                     ?? sparams.GetValueOrDefault("Letter")
+                     ?? sparams.GetValueOrDefault("StartingCharacter");
+
+        HandleSearch(xmlWriter, sparams, deviceId, string.IsNullOrWhiteSpace(letter) ? null : letter);
     }
 
     /// <summary>
@@ -409,22 +434,22 @@ public class ControlHandler : BaseControlHandler
     /// <param name="xmlWriter">The xmlWriter<see cref="XmlWriter"/>.</param>
     /// <param name="sparams">The method parameters.</param>
     /// <param name="deviceId">The deviceId<see cref="string"/>.</param>
-    private void HandleSearch(XmlWriter xmlWriter, IReadOnlyDictionary<string, string> sparams, string deviceId)
+    /// <param name="nameStartsWith">The letter the results have to start with, if any.</param>
+    private void HandleSearch(XmlWriter xmlWriter, IReadOnlyDictionary<string, string> sparams, string deviceId, string? nameStartsWith = null)
     {
-        var searchCriteria = new SearchCriteria(sparams.GetValueOrDefault("SearchCriteria", string.Empty));
+        // "*" is the criteria matching everything, and the fallback for a device that sends none
+        var searchCriteria = new SearchCriteria(sparams.GetValueOrDefault("SearchCriteria", "*"));
         var sortCriteria = new SortCriteria(sparams.GetValueOrDefault("SortCriteria", string.Empty));
         var filter = new Filter(sparams.GetValueOrDefault("Filter", "*"));
 
         // sort example: dc:title, dc:date
 
-        // Default to null instead of 0
-        // Upnp inspector sends 0 as requestedCount when it wants everything
-        int? requestedCount = null;
+        int? requestedCount = MaxPageSize;
         int? start = 0;
 
         if (sparams.ContainsKey("RequestedCount") && int.TryParse(sparams["RequestedCount"], out var requestedVal) && requestedVal > 0)
         {
-            requestedCount = requestedVal;
+            requestedCount = Math.Min(requestedVal, MaxPageSize);
         }
 
         if (sparams.ContainsKey("StartingIndex") && int.TryParse(sparams["StartingIndex"], out var startVal) && startVal > 0)
@@ -432,7 +457,7 @@ public class ControlHandler : BaseControlHandler
             start = startVal;
         }
 
-        QueryResult<BaseItem> childrenResult;
+        QueryResult<ServerItem> childrenResult;
         var settings = new XmlWriterSettings
         {
             Encoding = Encoding.UTF8,
@@ -455,19 +480,24 @@ public class ControlHandler : BaseControlHandler
 
             var item = serverItem.Item;
 
-            childrenResult = GetChildrenSorted(item, _user, searchCriteria, sortCriteria, start, requestedCount);
+            childrenResult = GetSearchResultWithParts(item, _user, searchCriteria, sortCriteria, start, requestedCount, nameStartsWith);
+
+            _didlBuilder.PreloadPeople([.. childrenResult.Items.Select(i => i.Item)]);
+
             foreach (var i in childrenResult.Items)
             {
-                if (i.IsDisplayedAsFolder)
+                var childItem = i.Item;
+
+                if (childItem.IsDisplayedAsFolder)
                 {
-                    var childCount = GetChildrenSorted(i, _user, searchCriteria, sortCriteria, null, 0)
+                    var childCount = GetChildrenSorted(childItem, _user, searchCriteria, sortCriteria, null, 0, nameStartsWith)
                         .TotalRecordCount;
 
-                    _didlBuilder.WriteFolderElement(writer, i, null, item, childCount, filter);
+                    _didlBuilder.WriteFolderElement(writer, childItem, null, item, childCount, filter);
                 }
                 else
                 {
-                    _didlBuilder.WriteItemElement(writer, i, _user, item, serverItem.StubType, deviceId, filter);
+                    _didlBuilder.WriteItemElement(writer, childItem, _user, item, serverItem.StubType, deviceId, filter, null, i.PartNumber);
                 }
             }
 
@@ -490,12 +520,14 @@ public class ControlHandler : BaseControlHandler
     /// <param name="sort">The <see cref="SortCriteria"/>.</param>
     /// <param name="startIndex">The start index.</param>
     /// <param name="limit">The maximum number to return.</param>
+    /// <param name="nameStartsWith">The letter the results have to start with, if any.</param>
     /// <returns>The <see cref="QueryResult{BaseItem}"/>.</returns>
-    private static QueryResult<BaseItem> GetChildrenSorted(BaseItem item, User? user, SearchCriteria search, SortCriteria sort, int? startIndex, int? limit)
+    private static QueryResult<BaseItem> GetChildrenSorted(BaseItem item, User? user, SearchCriteria search, SortCriteria sort, int? startIndex, int? limit, string? nameStartsWith = null)
     {
         var folder = (Folder)item;
 
         MediaType[] mediaTypes = [];
+        BaseItemKind[] itemTypes = [];
         bool? isFolder = null;
 
         switch (search.SearchType)
@@ -512,8 +544,15 @@ public class ControlHandler : BaseControlHandler
                 mediaTypes = [MediaType.Photo];
                 isFolder = false;
                 break;
+
+            // Naming the kind, where matching every folder would answer a search for playlists
+            // with every season, album and collection in the library as well
             case SearchType.Playlist:
+                itemTypes = [BaseItemKind.Playlist];
+                isFolder = true;
+                break;
             case SearchType.MusicAlbum:
+                itemTypes = [BaseItemKind.MusicAlbum];
                 isFolder = true;
                 break;
         }
@@ -529,6 +568,10 @@ public class ControlHandler : BaseControlHandler
             ExcludeItemTypes = [BaseItemKind.Book],
             IsFolder = isFolder,
             MediaTypes = mediaTypes,
+            IncludeItemTypes = itemTypes,
+            NameContains = search.NameContains,
+            NameStartsWith = nameStartsWith,
+            SearchTerm = search.SearchTerm,
             DtoOptions = GetDtoOptions()
         });
     }
@@ -551,19 +594,25 @@ public class ControlHandler : BaseControlHandler
     /// <param name="sort">The <see cref="SortCriteria"/>.</param>
     /// <param name="startIndex">The start index.</param>
     /// <param name="limit">The maximum number to return.</param>
+    /// <param name="ancestorId">The library to scope the listing to, if any.</param>
     /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
-    private QueryResult<ServerItem> GetUserItems(BaseItem item, StubType? stubType, User? user, SortCriteria sort, int? startIndex, int? limit)
+    private QueryResult<ServerItem> GetUserItems(BaseItem item, StubType? stubType, User? user, SortCriteria sort, int? startIndex, int? limit, Guid? ancestorId = null)
     {
         if (user is not null)
         {
+            if (item is UserRootFolder)
+            {
+                return GetUserViews(user, startIndex, limit);
+            }
+
             switch (item)
             {
                 case MusicGenre:
-                    return GetMusicGenreItems(item, user, sort, startIndex, limit);
+                    return GetMusicGenreItems(item, user, sort, startIndex, limit, ancestorId);
                 case MusicArtist:
-                    return GetMusicArtistItems(item, user, sort, startIndex, limit);
+                    return GetMusicArtistItems(item, user, sort, startIndex, limit, ancestorId);
                 case Genre:
-                    return GetGenreItems(item, user, sort, startIndex, limit);
+                    return GetGenreItems(item, user, sort, startIndex, limit, ancestorId);
             }
 
             if (stubType != StubType.Folder && item is IHasCollectionType collectionFolder)
@@ -607,6 +656,376 @@ public class ControlHandler : BaseControlHandler
 
         return ToResult(startIndex, queryResult);
     }
+
+    /// <summary>
+    /// Gets a value indicating whether a listing entry is written as a container.
+    /// </summary>
+    /// <param name="serverItem">The <see cref="ServerItem"/>.</param>
+    /// <returns><c>true</c> if the entry is written as a container.</returns>
+    private static bool IsWrittenAsContainer(ServerItem serverItem)
+        => serverItem.Item.IsDisplayedAsFolder || serverItem.StubType.HasValue;
+
+    /// <summary>
+    /// Gets a value indicating whether the children of a listing entry are the folder's own
+    /// children, so that they can be counted without listing them.
+    /// </summary>
+    /// <param name="serverItem">The <see cref="ServerItem"/>.</param>
+    /// <returns><c>true</c> if the entry is a folder listing its own children.</returns>
+    private bool ListsOwnChildren(ServerItem serverItem)
+    {
+        // A user view holds no children of its own, it delegates to the libraries behind it
+        if (serverItem.Item is not Folder || serverItem.Item is UserView || serverItem.StubType is not (null or StubType.Folder))
+        {
+            return false;
+        }
+
+        // Mirrors the dispatching in GetUserItems: a collection folder is listed as a set of stub
+        // containers rather than as its own children, unless it is browsed as a plain folder
+        return serverItem.StubType == StubType.Folder
+            || _user is null
+            || serverItem.Item is not IHasCollectionType
+            {
+                CollectionType: CollectionType.music
+                    or CollectionType.movies
+                    or CollectionType.tvshows
+                    or CollectionType.folders
+                    or CollectionType.livetv
+            };
+    }
+
+    /// <summary>
+    /// Determines the child count of every container in a listing, without listing the content of
+    /// each of them.
+    /// </summary>
+    /// <param name="children">The listing.</param>
+    /// <param name="parent">The <see cref="BaseItem"/> being browsed, if any.</param>
+    /// <param name="sort">The <see cref="SortCriteria"/>.</param>
+    /// <param name="ancestorIds">Receives the library each entry is scoped to, if any.</param>
+    /// <returns>The child counts, in the order of <paramref name="children"/>.</returns>
+    private int[] GetChildCounts(IReadOnlyList<ServerItem> children, BaseItem? parent, SortCriteria sort, Guid?[]? ancestorIds = null)
+    {
+        var counts = new int[children.Count];
+
+        // Folders are counted in a single batched query instead of one query per entry
+        List<Guid> folderIds = [];
+        List<int> folderIndexes = [];
+
+        // Genres and artists aggregate content by name and are batched per kind the same way
+        Dictionary<BaseItemKind, (List<Guid> Ids, List<int> Indexes)> nameItems = [];
+
+        // Stub containers cannot be batched into one query, so they are counted side by side
+        List<(int Index, ServerItem Child, Guid? AncestorId)> stubs = [];
+
+        for (var index = 0; index < children.Count; index++)
+        {
+            var child = children[index];
+
+            // A genre or artist aggregates content from every library. An id browsed into already
+            // names the library to stay within; one being listed takes it from its parent.
+            var ancestorId = child.AncestorId
+                             ?? (parent is not null && child.Item is IItemByName ? parent.Id : null);
+            if (ancestorIds is not null)
+            {
+                ancestorIds[index] = ancestorId;
+            }
+
+            if (!IsWrittenAsContainer(child))
+            {
+                continue;
+            }
+
+            var nameItemKind = GetNameItemKind(child.Item);
+            if (nameItemKind is not null)
+            {
+                if (!nameItems.TryGetValue(nameItemKind.Value, out var bucket))
+                {
+                    bucket = ([], []);
+                    nameItems[nameItemKind.Value] = bucket;
+                }
+
+                bucket.Ids.Add(child.Item.Id);
+                bucket.Indexes.Add(index);
+            }
+            else if (ListsOwnChildren(child))
+            {
+                folderIds.Add(child.Item.Id);
+                folderIndexes.Add(index);
+            }
+            else
+            {
+                // A stub container lists the result of a query rather than children of its own, so
+                // it needs a query of its own to be counted. Collected and run together below.
+                stubs.Add((index, child, ancestorId));
+            }
+        }
+
+        if (folderIds.Count > 0)
+        {
+            var folderCounts = _libraryManager.GetChildCountBatch(folderIds, _user);
+            for (var i = 0; i < folderIds.Count; i++)
+            {
+                counts[folderIndexes[i]] = folderCounts.GetValueOrDefault(folderIds[i]);
+            }
+        }
+
+        if (stubs.Count > 0)
+        {
+            // The counts of a menu are independent of each other, so running them side by side
+            // makes a menu cost about as much as its slowest entry rather than the sum of them all.
+            // Bounded, so browsing cannot fan a single request out across the whole library at once.
+            Parallel.ForEach(
+                stubs,
+                new ParallelOptions { MaxDegreeOfParallelism = Math.Min(stubs.Count, MaxCountConcurrency) },
+                stub =>
+                {
+                    // A stub that lists its query as it comes reports that query's own total, so
+                    // asking for a single row is enough to learn the count. One that assembles its
+                    // listing has to be listed, because the total of the query behind it counts
+                    // content the listing never shows.
+                    counts[stub.Index] = IsListedInMemory(stub.Child.StubType)
+                        ? GetUserItemsWithParts(stub.Child.Item, stub.Child.StubType, _user, sort, null, null, stub.AncestorId)
+                            .TotalRecordCount
+                        : GetUserItems(stub.Child.Item, stub.Child.StubType, _user, sort, 0, 1, stub.AncestorId)
+                            .TotalRecordCount;
+                });
+        }
+
+        foreach (var (kind, bucket) in nameItems)
+        {
+            var relatedKinds = NameItemRelatedKinds[kind];
+            var nameItemCounts = _libraryManager.GetItemCountsForNameItems(kind, bucket.Ids, relatedKinds, _user);
+
+            for (var i = 0; i < bucket.Ids.Count; i++)
+            {
+                var itemCounts = nameItemCounts.GetValueOrDefault(bucket.Ids[i]);
+                if (itemCounts is null)
+                {
+                    continue;
+                }
+
+                counts[bucket.Indexes[i]] = kind == BaseItemKind.Genre
+                    ? itemCounts.MovieCount + itemCounts.SeriesCount
+                    : itemCounts.AlbumCount;
+            }
+        }
+
+        return counts;
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether the listing of a stub is assembled in memory rather than
+    /// taken from a query as it comes, so that its count is the length of that listing.
+    /// </summary>
+    /// <param name="stubType">The <see cref="StubType"/>, or <c>null</c> for a library listed as
+    /// its menu of stubs.</param>
+    /// <returns><c>true</c> if only listing it reports its count.</returns>
+    /// <remarks>
+    /// These listings cap themselves, so asking their query for a total reports how much content
+    /// exists rather than how much the listing shows, and a client is told a count it can never
+    /// browse to. All of them are small, so listing them to count them is cheap.
+    /// </remarks>
+    private static bool IsListedInMemory(StubType? stubType)
+        => stubType is null
+            or StubType.ContinueWatching
+            or StubType.NextUp
+            or StubType.Latest;
+
+    /// <summary>
+    /// Gets the kind a container aggregating content by name is counted as.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/>.</param>
+    /// <returns>The <see cref="BaseItemKind"/>, or <c>null</c> if the item is not one.</returns>
+    private static BaseItemKind? GetNameItemKind(BaseItem item)
+        => item switch
+        {
+            MusicGenre => BaseItemKind.MusicGenre,
+            MusicArtist => BaseItemKind.MusicArtist,
+            Genre => BaseItemKind.Genre,
+            _ => null
+        };
+
+    /// <summary>
+    /// Returns the User items meeting the criteria, with every stacked (multi-part) video replaced
+    /// by one item per part.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/>.</param>
+    /// <param name="stubType">The <see cref="StubType"/>.</param>
+    /// <param name="user">The <see cref="User"/>.</param>
+    /// <param name="sort">The <see cref="SortCriteria"/>.</param>
+    /// <param name="startIndex">The start index.</param>
+    /// <param name="limit">The maximum number to return.</param>
+    /// <param name="ancestorId">The library to scope the listing to, if any.</param>
+    /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
+    private QueryResult<ServerItem> GetUserItemsWithParts(BaseItem item, StubType? stubType, User? user, SortCriteria sort, int? startIndex, int? limit, Guid? ancestorId = null)
+    {
+        // A listing that is assembled rather than queried has to be read whole and paged here.
+        if (IsAssembledListing(item, stubType))
+        {
+            return ApplyPaging(ExpandStackedVideos(GetUserItems(item, stubType, user, sort, null, null, ancestorId).Items, user), startIndex, limit);
+        }
+
+        // Everything else is a query that can return the page on its own, where reading every row
+        // of a library to hand back one page of it costs the same whether a client asked for
+        // twenty rows or for all of them. The parts of a multi-part video are expanded inside the
+        // page that carries the video, and the page is trimmed again so that a client never gets
+        // back more rows than it asked for.
+        var result = GetUserItems(item, stubType, user, sort, startIndex, limit, ancestorId);
+
+        var expanded = ExpandStackedVideos(result.Items, user);
+
+        return new QueryResult<ServerItem>(
+            startIndex,
+            result.TotalRecordCount,
+            limit.HasValue && expanded.Length > limit.Value ? expanded[..limit.Value] : expanded);
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether a listing is assembled in memory rather than taken from a
+    /// query, so that it has to be read whole before a page of it can be handed back.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/> being listed.</param>
+    /// <param name="stubType">The <see cref="StubType"/>, if any.</param>
+    /// <returns><c>true</c> if the listing is assembled.</returns>
+    /// <remarks>
+    /// This mirrors the dispatching in GetUserItems. The root and a library browsed as its menu of
+    /// stubs are fixed arrays, and Latest, Continue Watching and Next Up cap or renumber theirs.
+    /// All of them are small, so reading them whole costs little.
+    /// </remarks>
+    private static bool IsAssembledListing(BaseItem item, StubType? stubType)
+    {
+        if (item is UserRootFolder
+            || stubType is StubType.Latest or StubType.ContinueWatching or StubType.NextUp)
+        {
+            return true;
+        }
+
+        // A library with no stub type of its own is listed as its menu. The folders and live tv
+        // views are not, they list their content straight from a query.
+        return stubType is null
+            && item is IHasCollectionType
+            {
+                CollectionType: CollectionType.music or CollectionType.movies or CollectionType.tvshows
+            };
+    }
+
+    /// <summary>
+    /// Returns the search results meeting the criteria, with every stacked (multi-part) video
+    /// replaced by one item per part.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/>.</param>
+    /// <param name="user">The <see cref="User"/>.</param>
+    /// <param name="search">The <see cref="SearchCriteria"/>.</param>
+    /// <param name="sort">The <see cref="SortCriteria"/>.</param>
+    /// <param name="startIndex">The start index.</param>
+    /// <param name="limit">The maximum number to return.</param>
+    /// <param name="nameStartsWith">The letter the results have to start with, if any.</param>
+    /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
+    private QueryResult<ServerItem> GetSearchResultWithParts(BaseItem item, User? user, SearchCriteria search, SortCriteria sort, int? startIndex, int? limit, string? nameStartsWith = null)
+    {
+        // A search spans a whole library, so the page has to come out of the query: reading every
+        // match to hand back one page of it costs the same whether the client wants 20 rows or all
+        // of them. The parts of a multi-part video are expanded within the page that carries the
+        // video, and the page is trimmed again afterwards so that a client never gets back more
+        // rows than it asked for.
+        var result = GetChildrenSorted(item, user, search, sort, startIndex, limit, nameStartsWith);
+
+        var expanded = ExpandStackedVideos(ToResult(startIndex, result).Items, user);
+
+        return new QueryResult<ServerItem>(
+            startIndex,
+            result.TotalRecordCount,
+            limit.HasValue && expanded.Length > limit.Value ? expanded[..limit.Value] : expanded);
+    }
+
+    /// <summary>
+    /// Replaces every stacked (multi-part) video in a listing by one item per part, so that the
+    /// parts beyond the first one can be browsed and played as well.
+    /// </summary>
+    /// <param name="items">The listing to expand.</param>
+    /// <param name="user">The <see cref="User"/>.</param>
+    /// <returns>The expanded listing.</returns>
+    private static ServerItem[] ExpandStackedVideos(IReadOnlyList<ServerItem> items, User? user)
+    {
+        var stacked = items.Any(IsStackedVideo);
+        if (!stacked)
+        {
+            return items as ServerItem[] ?? [.. items];
+        }
+
+        List<ServerItem> expanded = [];
+        foreach (var serverItem in items)
+        {
+            if (!IsStackedVideo(serverItem))
+            {
+                expanded.Add(serverItem);
+                continue;
+            }
+
+            var video = (Video)serverItem.Item;
+            var partNumber = 1;
+
+            expanded.Add(new ServerItem(video, serverItem.StubType, partNumber));
+            foreach (var part in video.GetAdditionalParts(user))
+            {
+                expanded.Add(new ServerItem(part, null, ++partNumber));
+            }
+        }
+
+        return [.. expanded];
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether a listing entry is a stacked (multi-part) video.
+    /// </summary>
+    /// <param name="serverItem">The <see cref="ServerItem"/>.</param>
+    /// <returns><c>true</c> if the entry is a stacked video.</returns>
+    private static bool IsStackedVideo(ServerItem serverItem)
+        => serverItem.Item is Video { IsStacked: true } && !serverItem.StubType.HasValue;
+
+    /// <summary>
+    /// Gets the one based part number of a video that belongs to a stacked (multi-part) video.
+    /// </summary>
+    /// <param name="item">The <see cref="BaseItem"/>.</param>
+    /// <returns>The part number, or <c>null</c> when the item is not part of a stack.</returns>
+    private int? GetPartNumber(BaseItem item)
+    {
+        if (item is not Video video)
+        {
+            return null;
+        }
+
+        if (video.IsStacked)
+        {
+            return 1;
+        }
+
+        if (video.OwnerId.Equals(default) || video.GetOwner() is not Video { IsStacked: true } owner)
+        {
+            return null;
+        }
+
+        var partNumber = 1;
+        foreach (var part in owner.GetAdditionalParts(_user))
+        {
+            partNumber++;
+            if (part.Id.Equals(video.Id))
+            {
+                return partNumber;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Applies the requested paging window to a listing.
+    /// </summary>
+    /// <param name="serverItems">The full listing.</param>
+    /// <param name="startIndex">The start index.</param>
+    /// <param name="limit">The maximum number to return.</param>
+    /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
+    private static QueryResult<ServerItem> ApplyPaging(ServerItem[] serverItems, int? startIndex, int? limit)
+        => new(startIndex, serverItems.Length, GetTrimmedServerItemsArray(serverItems, startIndex, limit));
 
     /// <summary>
     /// Returns the Live Tv Channels meeting the criteria.
@@ -745,6 +1164,24 @@ public class ControlHandler : BaseControlHandler
             startIndex,
             array.Length,
             array);
+    }
+
+    /// <summary>
+    /// Returns the user views, which is the top level listing every other client is served.
+    /// </summary>
+    /// <param name="user">The <see cref="User"/>.</param>
+    /// <param name="startIndex">The start index.</param>
+    /// <param name="limit">The maximum number to return.</param>
+    /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
+    /// <remarks>
+    /// Listing the raw children of the user root folder instead would skip library grouping, the
+    /// hidden library and display order preferences, and the synthetic views such as "Folders".
+    /// </remarks>
+    private QueryResult<ServerItem> GetUserViews(User user, int? startIndex, int? limit)
+    {
+        var views = _userViewManager.GetUserViews(new UserViewQuery { User = user });
+
+        return ApplyPaging([.. views.Select(i => new ServerItem(i, null))], startIndex, limit);
     }
 
     /// <summary>
@@ -1065,13 +1502,15 @@ public class ControlHandler : BaseControlHandler
     /// <param name="sort">The <see cref="SortCriteria"/>.</param>
     /// <param name="startIndex">The start index.</param>
     /// <param name="limit">The maximum number to return.</param>
+    /// <param name="ancestorId">The library to scope the artist to, if any.</param>
     /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
-    private QueryResult<ServerItem> GetMusicArtistItems(BaseItem item, User user, SortCriteria sort, int? startIndex, int? limit)
+    private QueryResult<ServerItem> GetMusicArtistItems(BaseItem item, User user, SortCriteria sort, int? startIndex, int? limit, Guid? ancestorId)
     {
         var query = new InternalItemsQuery(user)
         {
             Recursive = true,
             ArtistIds = [item.Id],
+            AncestorIds = ancestorId.HasValue ? [ancestorId.Value] : [],
             IncludeItemTypes = [BaseItemKind.MusicAlbum],
             Limit = limit,
             StartIndex = startIndex,
@@ -1092,13 +1531,15 @@ public class ControlHandler : BaseControlHandler
     /// <param name="sort">The <see cref="SortCriteria"/>.</param>
     /// <param name="startIndex">The start index.</param>
     /// <param name="limit">The maximum number to return.</param>
+    /// <param name="ancestorId">The library to scope the genre to, if any.</param>
     /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
-    private QueryResult<ServerItem> GetGenreItems(BaseItem item, User user, SortCriteria sort, int? startIndex, int? limit)
+    private QueryResult<ServerItem> GetGenreItems(BaseItem item, User user, SortCriteria sort, int? startIndex, int? limit, Guid? ancestorId)
     {
         var query = new InternalItemsQuery(user)
         {
             Recursive = true,
             GenreIds = [item.Id],
+            AncestorIds = ancestorId.HasValue ? [ancestorId.Value] : [],
             IncludeItemTypes =
             [
                 BaseItemKind.Movie,
@@ -1123,13 +1564,15 @@ public class ControlHandler : BaseControlHandler
     /// <param name="sort">The <see cref="SortCriteria"/>.</param>
     /// <param name="startIndex">The start index.</param>
     /// <param name="limit">The maximum number to return.</param>
+    /// <param name="ancestorId">The library to scope the genre to, if any.</param>
     /// <returns>The <see cref="QueryResult{ServerItem}"/>.</returns>
-    private QueryResult<ServerItem> GetMusicGenreItems(BaseItem item, User user, SortCriteria sort, int? startIndex, int? limit)
+    private QueryResult<ServerItem> GetMusicGenreItems(BaseItem item, User user, SortCriteria sort, int? startIndex, int? limit, Guid? ancestorId)
     {
         var query = new InternalItemsQuery(user)
         {
             Recursive = true,
             GenreIds = [item.Id],
+            AncestorIds = ancestorId.HasValue ? [ancestorId.Value] : [],
             IncludeItemTypes = [BaseItemKind.MusicAlbum],
             Limit = limit,
             StartIndex = startIndex,
@@ -1209,6 +1652,14 @@ public class ControlHandler : BaseControlHandler
     /// <param name="isPreSorted">True if pre-sorted.</param>
     private static (ItemSortBy SortName, SortOrder SortOrder)[] GetOrderBy(SortCriteria sort, bool isPreSorted)
     {
+        // An explicit request wins over the natural order of a pre-sorted folder: a control point
+        // that asked for its tracks by album and track number pages them expecting that order, and
+        // groups what it gets, so handing back a different order breaks the listing it builds.
+        if (sort.Fields.Count > 0)
+        {
+            return [.. sort.Fields];
+        }
+
         return isPreSorted ? Array.Empty<(ItemSortBy, SortOrder)>() : [(ItemSortBy.SortName, sort.SortOrder)];
     }
 
@@ -1241,7 +1692,18 @@ public class ControlHandler : BaseControlHandler
             id = id[(paramsIndex + ParamsSrch.Length)..];
 
             var parts = id.Split(';');
-            id = parts[23];
+
+            // Anything else carrying the marker is not the request this handles, and indexing
+            // into it blindly would fault the whole browse
+            const int ItemIdPart = 23;
+            if (parts.Length <= ItemIdPart)
+            {
+                Logger.LogError("Unexpected item Id: {Id}. Returning user root folder.", id);
+
+                return new ServerItem(_libraryManager.GetUserRootFolder(), null);
+            }
+
+            id = parts[ItemIdPart];
         }
 
         var dividerIndex = id.IndexOf('_', StringComparison.Ordinal);
@@ -1251,12 +1713,22 @@ public class ControlHandler : BaseControlHandler
             stubType = parsedStubType;
         }
 
+        // An id may carry the library the client browsed in from, so that listings which would
+        // otherwise span every library stay scoped to it. Ids without it keep parsing as before.
+        Guid? ancestorId = null;
+        var ancestorIndex = id.IndexOf('_', StringComparison.Ordinal);
+        if (ancestorIndex != -1 && Guid.TryParse(id.AsSpan(ancestorIndex + 1), out var parsedAncestorId))
+        {
+            ancestorId = parsedAncestorId;
+            id = id[..ancestorIndex];
+        }
+
         if (Guid.TryParse(id, out var itemId))
         {
             var item = _libraryManager.GetItemById(itemId);
             if (item is not null)
             {
-                return new ServerItem(item, stubType);
+                return new ServerItem(item, stubType, ancestorId: ancestorId);
             }
         }
 
@@ -1271,7 +1743,7 @@ public class ControlHandler : BaseControlHandler
     /// <param name="serverItems">An array of <see cref="ServerItem"/>.</param>
     /// <param name="startIndex">The start index.</param>
     /// <param name="limit">The maximum number to return.</param>
-    /// <returns>The corresponding trimmed array of <see cref="ServerItem"/></returns>
+    /// <returns>The corresponding trimmed array of <see cref="ServerItem"/>.</returns>
     private static ServerItem[] GetTrimmedServerItemsArray(ServerItem[] serverItems, int? startIndex, int? limit)
     {
         if (startIndex >= serverItems.Length)

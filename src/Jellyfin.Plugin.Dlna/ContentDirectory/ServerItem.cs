@@ -1,3 +1,4 @@
+using System;
 using MediaBrowser.Controller.Entities;
 
 namespace Jellyfin.Plugin.Dlna.ContentDirectory;
@@ -12,9 +13,13 @@ internal sealed class ServerItem
     /// </summary>
     /// <param name="item">The <see cref="BaseItem"/>.</param>
     /// <param name="stubType">The stub type.</param>
-    public ServerItem(BaseItem item, StubType? stubType)
+    /// <param name="partNumber">The one based part number of a stacked (multi-part) video.</param>
+    /// <param name="ancestorId">The library the client browsed in from.</param>
+    public ServerItem(BaseItem item, StubType? stubType, int? partNumber = null, Guid? ancestorId = null)
     {
         Item = item;
+        PartNumber = partNumber;
+        AncestorId = ancestorId;
 
         if (stubType.HasValue)
         {
@@ -35,4 +40,15 @@ internal sealed class ServerItem
     /// Gets the DLNA item type.
     /// </summary>
     public StubType? StubType { get; }
+
+    /// <summary>
+    /// Gets the one based part number when the item is one part of a stacked (multi-part) video.
+    /// </summary>
+    public int? PartNumber { get; }
+
+    /// <summary>
+    /// Gets the library the client browsed in from, for items such as genres and artists whose
+    /// content otherwise spans every library.
+    /// </summary>
+    public Guid? AncestorId { get; }
 }
