@@ -49,17 +49,6 @@ public class ControlHandler : BaseControlHandler
     /// </summary>
     private const int MaxCountConcurrency = 4;
 
-    /// <summary>
-    /// The item kinds counted for a container that aggregates content by name. These have to match
-    /// what GetUserItems lists for the container.
-    /// </summary>
-    private static readonly Dictionary<BaseItemKind, BaseItemKind[]> NameItemRelatedKinds = new()
-    {
-        [BaseItemKind.MusicGenre] = [BaseItemKind.MusicAlbum],
-        [BaseItemKind.MusicArtist] = [BaseItemKind.MusicAlbum],
-        [BaseItemKind.Genre] = [BaseItemKind.Movie, BaseItemKind.Series]
-    };
-
     private readonly ILibraryManager _libraryManager;
     private readonly IUserDataManager _userDataManager;
     private readonly User? _user;
@@ -364,7 +353,7 @@ public class ControlHandler : BaseControlHandler
                 {
                     var childCount = GetChildCounts([serverItem], null, sortCriteria)[0];
 
-                    _didlBuilder.WriteFolderElement(writer, item, serverItem.StubType, null, childCount, filter, id);
+                    _didlBuilder.WriteFolderElement(writer, item, serverItem.StubType, null, childCount, filter, id, serverItem.AncestorId);
                 }
                 else
                 {
@@ -673,8 +662,12 @@ public class ControlHandler : BaseControlHandler
     /// <returns><c>true</c> if the entry is a folder listing its own children.</returns>
     private bool ListsOwnChildren(ServerItem serverItem)
     {
-        // A user view holds no children of its own, it delegates to the libraries behind it
-        if (serverItem.Item is not Folder || serverItem.Item is UserView || serverItem.StubType is not (null or StubType.Folder))
+        // A user view holds no children of its own, it delegates to the libraries behind it, and a
+        // container that aggregates by name lists what a query returns rather than any children
+        if (serverItem.Item is not Folder
+            || serverItem.Item is UserView
+            || GetNameItemKind(serverItem.Item) is not null
+            || serverItem.StubType is not (null or StubType.Folder))
         {
             return false;
         }
@@ -710,9 +703,6 @@ public class ControlHandler : BaseControlHandler
         List<Guid> folderIds = [];
         List<int> folderIndexes = [];
 
-        // Genres and artists aggregate content by name and are batched per kind the same way
-        Dictionary<BaseItemKind, (List<Guid> Ids, List<int> Indexes)> nameItems = [];
-
         // Stub containers cannot be batched into one query, so they are counted side by side
         List<(int Index, ServerItem Child, Guid? AncestorId)> stubs = [];
 
@@ -734,17 +724,10 @@ public class ControlHandler : BaseControlHandler
                 continue;
             }
 
-            var nameItemKind = GetNameItemKind(child.Item);
-            if (nameItemKind is not null)
+            var genreCount = GetGenreChildCount(child);
+            if (genreCount.HasValue)
             {
-                if (!nameItems.TryGetValue(nameItemKind.Value, out var bucket))
-                {
-                    bucket = ([], []);
-                    nameItems[nameItemKind.Value] = bucket;
-                }
-
-                bucket.Ids.Add(child.Item.Id);
-                bucket.Indexes.Add(index);
+                counts[index] = genreCount.Value;
             }
             else if (ListsOwnChildren(child))
             {
@@ -782,31 +765,12 @@ public class ControlHandler : BaseControlHandler
                     // asking for a single row is enough to learn the count. One that assembles its
                     // listing has to be listed, because the total of the query behind it counts
                     // content the listing never shows.
-                    counts[stub.Index] = IsListedInMemory(stub.Child.StubType)
+                    counts[stub.Index] = IsListedInMemory(stub.Child)
                         ? GetUserItemsWithParts(stub.Child.Item, stub.Child.StubType, _user, sort, null, null, stub.AncestorId)
                             .TotalRecordCount
                         : GetUserItems(stub.Child.Item, stub.Child.StubType, _user, sort, 0, 1, stub.AncestorId)
                             .TotalRecordCount;
                 });
-        }
-
-        foreach (var (kind, bucket) in nameItems)
-        {
-            var relatedKinds = NameItemRelatedKinds[kind];
-            var nameItemCounts = _libraryManager.GetItemCountsForNameItems(kind, bucket.Ids, relatedKinds, _user);
-
-            for (var i = 0; i < bucket.Ids.Count; i++)
-            {
-                var itemCounts = nameItemCounts.GetValueOrDefault(bucket.Ids[i]);
-                if (itemCounts is null)
-                {
-                    continue;
-                }
-
-                counts[bucket.Indexes[i]] = kind == BaseItemKind.Genre
-                    ? itemCounts.MovieCount + itemCounts.SeriesCount
-                    : itemCounts.AlbumCount;
-            }
         }
 
         return counts;
@@ -816,19 +780,29 @@ public class ControlHandler : BaseControlHandler
     /// Gets a value indicating whether the listing of a stub is assembled in memory rather than
     /// taken from a query as it comes, so that its count is the length of that listing.
     /// </summary>
-    /// <param name="stubType">The <see cref="StubType"/>, or <c>null</c> for a library listed as
-    /// its menu of stubs.</param>
+    /// <param name="item">The <see cref="ServerItem"/>.</param>
     /// <returns><c>true</c> if only listing it reports its count.</returns>
     /// <remarks>
     /// These listings cap themselves, so asking their query for a total reports how much content
     /// exists rather than how much the listing shows, and a client is told a count it can never
-    /// browse to. All of them are small, so listing them to count them is cheap.
+    /// browse to. All of them are small, so listing them to count them is cheap. A genre or artist
+    /// carries no stub type of its own but lists a plain query, which reports its own total.
     /// </remarks>
-    private static bool IsListedInMemory(StubType? stubType)
-        => stubType is null
-            or StubType.ContinueWatching
+    private static bool IsListedInMemory(ServerItem item)
+        => item.StubType is StubType.ContinueWatching
             or StubType.NextUp
-            or StubType.Latest;
+            or StubType.Latest
+            || (item.StubType is null && GetNameItemKind(item.Item) is null);
+
+    private static int? GetGenreChildCount(ServerItem child)
+        => child.ItemCounts is null
+            ? null
+            : child.Item switch
+            {
+                MusicGenre => child.ItemCounts.AlbumCount,
+                Genre => child.ItemCounts.MovieCount + child.ItemCounts.SeriesCount,
+                _ => null
+            };
 
     /// <summary>
     /// Gets the kind a container aggregating content by name is counted as.
@@ -1510,7 +1484,7 @@ public class ControlHandler : BaseControlHandler
         {
             Recursive = true,
             ArtistIds = [item.Id],
-            AncestorIds = ancestorId.HasValue ? [ancestorId.Value] : [],
+            ParentId = ancestorId ?? Guid.Empty,
             IncludeItemTypes = [BaseItemKind.MusicAlbum],
             Limit = limit,
             StartIndex = startIndex,
@@ -1539,7 +1513,7 @@ public class ControlHandler : BaseControlHandler
         {
             Recursive = true,
             GenreIds = [item.Id],
-            AncestorIds = ancestorId.HasValue ? [ancestorId.Value] : [],
+            ParentId = ancestorId ?? Guid.Empty,
             IncludeItemTypes =
             [
                 BaseItemKind.Movie,
@@ -1572,7 +1546,7 @@ public class ControlHandler : BaseControlHandler
         {
             Recursive = true,
             GenreIds = [item.Id],
-            AncestorIds = ancestorId.HasValue ? [ancestorId.Value] : [],
+            ParentId = ancestorId ?? Guid.Empty,
             IncludeItemTypes = [BaseItemKind.MusicAlbum],
             Limit = limit,
             StartIndex = startIndex,
@@ -1636,7 +1610,7 @@ public class ControlHandler : BaseControlHandler
         var serverItems = new ServerItem[length];
         for (var i = 0; i < length; i++)
         {
-            serverItems[i] = new ServerItem(result.Items[i].Item, null);
+            serverItems[i] = new ServerItem(result.Items[i].Item, null, itemCounts: result.Items[i].ItemCounts);
         }
 
         return new QueryResult<ServerItem>(

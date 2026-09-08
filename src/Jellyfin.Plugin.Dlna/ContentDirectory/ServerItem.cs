@@ -1,5 +1,6 @@
 using System;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Model.Dto;
 
 namespace Jellyfin.Plugin.Dlna.ContentDirectory;
 
@@ -15,11 +16,13 @@ internal sealed class ServerItem
     /// <param name="stubType">The stub type.</param>
     /// <param name="partNumber">The one based part number of a stacked (multi-part) video.</param>
     /// <param name="ancestorId">The library the client browsed in from.</param>
-    public ServerItem(BaseItem item, StubType? stubType, int? partNumber = null, Guid? ancestorId = null)
+    /// <param name="itemCounts">The counts the listing reported for the item, if any.</param>
+    public ServerItem(BaseItem item, StubType? stubType, int? partNumber = null, Guid? ancestorId = null, ItemCounts? itemCounts = null)
     {
         Item = item;
         PartNumber = partNumber;
         AncestorId = ancestorId;
+        ItemCounts = itemCounts;
 
         if (stubType.HasValue)
         {
@@ -51,4 +54,10 @@ internal sealed class ServerItem
     /// content otherwise spans every library.
     /// </summary>
     public Guid? AncestorId { get; }
+
+    /// <summary>
+    /// Gets the counts the listing this item came from reported for it, if it reported any. They
+    /// carry the scope of that listing, so a genre listed under a library is counted within it.
+    /// </summary>
+    public ItemCounts? ItemCounts { get; }
 }
