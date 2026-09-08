@@ -20,6 +20,16 @@ namespace Jellyfin.Plugin.Dlna.PlayTo;
 /// </summary>
 public class Device : IDisposable
 {
+    private const int ImmediateTimerInterval = 100;
+    private const int ActiveTimerInterval = 10000;
+    private const int TransportChangeTimerInterval = 500;
+
+    /// <summary>
+    /// How long a renderer is given to come up after it was handed a new track before what it
+    /// reports is taken at face value.
+    /// </summary>
+    private static readonly TimeSpan _transportChangeGrace = TimeSpan.FromSeconds(5);
+
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger _logger;
     private readonly object _timerLock = new();
@@ -29,6 +39,8 @@ public class Device : IDisposable
     private DateTime _lastVolumeRefresh;
     private bool _volumeRefreshActive;
     private int _connectFailureCount;
+    private int _transportChanges;
+    private DateTime _transportChangedAt = DateTime.MinValue;
     private bool _disposed;
 
     /// <summary>
@@ -174,6 +186,9 @@ public class Device : IDisposable
     }
 
     private void RestartTimer(bool immediate = false)
+        => RestartTimerIn(immediate ? ImmediateTimerInterval : ActiveTimerInterval);
+
+    private void RestartTimerIn(int dueTime)
     {
         lock (_timerLock)
         {
@@ -184,8 +199,7 @@ public class Device : IDisposable
 
             _volumeRefreshActive = true;
 
-            var time = immediate ? 100 : 10000;
-            _timer?.Change(time, Timeout.Infinite);
+            _timer?.Change(dueTime, Timeout.Infinite);
         }
     }
 
@@ -420,39 +434,52 @@ public class Device : IDisposable
         var service = GetAvTransportService() ?? throw new InvalidOperationException("Unable to find service");
         var post = avCommands!.BuildPost(command, service.ServiceType, url, dictionary); // null checked above
 
-        // AVTransport:1 section 2.4.2 defines SetAVTransportURI for the STOPPED and NO_MEDIA_PRESENT states only.
-        // A renderer that is still playing, e.g. because it was stopped from its own remote, answers every
-        // following request with 705 (Transport is locked) until it is stopped.
-        try
-        {
-            await SetStop(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // Stopping a transport that is already idle is a no-op that some devices fault on
-            _logger.LogDebug(ex, "{Name} - Stop before SetAVTransportURI failed", Properties.Name);
-        }
-
-        await new DlnaHttpClient(_logger, _httpClientFactory)
-            .SendCommandAsync(
-                NormalizeUrl(service.ControlUrl),
-                service,
-                command.Name,
-                post,
-                header: header,
-                cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-
-        await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        // The transport passes through STOPPED on the way to the new track. A poll landing in that
+        // window would report the previous track as stopped and park the timer as if the renderer
+        // had gone idle, which leaves the whole playback of the new track unreported.
+        Interlocked.Increment(ref _transportChanges);
 
         try
         {
-            await SetPlay(avCommands, cancellationToken).ConfigureAwait(false);
+            // AVTransport:1 section 2.4.2 defines SetAVTransportURI for the STOPPED and NO_MEDIA_PRESENT states only.
+            // A renderer that is still playing, e.g. because it was stopped from its own remote, answers every
+            // following request with 705 (Transport is locked) until it is stopped.
+            try
+            {
+                await SetStop(avCommands!, cancellationToken).ConfigureAwait(false); // null checked above
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Stopping a transport that is already idle is a no-op that some devices fault on
+                _logger.LogDebug(ex, "{Name} - Stop before SetAVTransportURI failed", Properties.Name);
+            }
+
+            await new DlnaHttpClient(_logger, _httpClientFactory)
+                .SendCommandAsync(
+                    NormalizeUrl(service.ControlUrl),
+                    service,
+                    command.Name,
+                    post,
+                    header: header,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+
+            try
+            {
+                await SetPlay(avCommands!, cancellationToken).ConfigureAwait(false); // null checked above
+            }
+            catch
+            {
+                // Some devices will throw an error if you tell it to play when it's already playing
+                // Others won't
+            }
         }
-        catch
+        finally
         {
-            // Some devices will throw an error if you tell it to play when it's already playing
-            // Others won't
+            _transportChangedAt = DateTime.UtcNow;
+            Interlocked.Decrement(ref _transportChanges);
         }
 
         RestartTimer(true);
@@ -509,6 +536,23 @@ public class Device : IDisposable
         return SecurityElement.Escape(value);
     }
 
+    private Task SetStop(TransportCommands avCommands, CancellationToken cancellationToken)
+    {
+        var command = avCommands.ServiceActions.FirstOrDefault(c => c.Name == "Stop");
+        if (command is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        var service = GetAvTransportService() ?? throw new InvalidOperationException("Unable to find service");
+        return new DlnaHttpClient(_logger, _httpClientFactory).SendCommandAsync(
+            NormalizeUrl(service.ControlUrl),
+            service,
+            command.Name,
+            avCommands.BuildPost(command, service.ServiceType, 1),
+            cancellationToken: cancellationToken);
+    }
+
     private Task SetPlay(TransportCommands avCommands, CancellationToken cancellationToken)
     {
         var command = avCommands.ServiceActions.FirstOrDefault(c => c.Name == "Play");
@@ -552,22 +596,15 @@ public class Device : IDisposable
     public async Task SetStop(CancellationToken cancellationToken)
     {
         var avCommands = await GetAVProtocolAsync(cancellationToken).ConfigureAwait(false);
-
-        var command = avCommands?.ServiceActions.FirstOrDefault(c => c.Name == "Stop");
-        if (command is null)
+        if (avCommands is null)
         {
             return;
         }
 
-        var service = GetAvTransportService() ?? throw new InvalidOperationException("Unable to find service");
-        await new DlnaHttpClient(_logger, _httpClientFactory)
-            .SendCommandAsync(
-                NormalizeUrl(service.ControlUrl),
-                service,
-                command.Name,
-                avCommands!.BuildPost(command, service.ServiceType, 1), // null checked above
-                cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
+        await SetStop(avCommands, cancellationToken).ConfigureAwait(false);
+
+        // Stopping is meant to be observed right away, it is not a renderer on its way to a new track
+        _transportChangedAt = DateTime.MinValue;
 
         RestartTimer(true);
     }
@@ -609,6 +646,14 @@ public class Device : IDisposable
             return;
         }
 
+        // A transport change stops the renderer before handing it the next track, so what it reports
+        // in the meantime says nothing about what it is about to play. Come back once it is through.
+        if (Volatile.Read(ref _transportChanges) > 0)
+        {
+            RestartTimer(true);
+            return;
+        }
+
         try
         {
             var cancellationToken = CancellationToken.None;
@@ -631,6 +676,18 @@ public class Device : IDisposable
 
             if (transportState.HasValue)
             {
+                // A renderer that was just handed a new track can still report STOPPED while it opens
+                // the stream. Taking that as idle would report the previous track as stopped and park
+                // the timer, so the playback that follows would never be reported at all.
+                if (transportState.Value == TransportState.STOPPED
+                    && DateTime.UtcNow - _transportChangedAt < _transportChangeGrace)
+                {
+                    _connectFailureCount = 0;
+                    RestartTimerIn(TransportChangeTimerInterval);
+
+                    return;
+                }
+
                 // If we're not playing anything no need to get additional data
                 if (transportState.Value == TransportState.STOPPED)
                 {
